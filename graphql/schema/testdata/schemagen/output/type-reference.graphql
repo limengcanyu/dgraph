@@ -187,7 +187,7 @@ directive @hasInverse(field: String!) on FIELD_DEFINITION
 directive @search(by: [DgraphIndex!]) on FIELD_DEFINITION
 directive @dgraph(type: String, pred: String) on OBJECT | INTERFACE | FIELD_DEFINITION
 directive @id on FIELD_DEFINITION
-directive @withSubscription on OBJECT | INTERFACE
+directive @withSubscription on OBJECT | INTERFACE | FIELD_DEFINITION
 directive @secret(field: String!, pred: String) on OBJECT | INTERFACE
 directive @auth(
 	password: AuthRule
@@ -197,8 +197,10 @@ directive @auth(
 	delete: AuthRule) on OBJECT | INTERFACE
 directive @custom(http: CustomHTTP, dql: String) on FIELD_DEFINITION
 directive @remote on OBJECT | INTERFACE | UNION | INPUT_OBJECT | ENUM
+directive @remoteResponse(name: String) on FIELD_DEFINITION
 directive @cascade(fields: [String]) on FIELD
 directive @lambda on FIELD_DEFINITION
+directive @lambdaOnMutate(add: Boolean, update: Boolean, delete: Boolean) on OBJECT | INTERFACE
 directive @cacheControl(maxAge: Int!) on QUERY
 directive @generate(
 	query: GenerateQueryParams,
@@ -207,6 +209,7 @@ directive @generate(
 
 input IntFilter {
 	eq: Int
+	in: [Int]
 	le: Int
 	lt: Int
 	ge: Int
@@ -216,6 +219,7 @@ input IntFilter {
 
 input Int64Filter {
 	eq: Int64
+	in: [Int64]
 	le: Int64
 	lt: Int64
 	ge: Int64
@@ -225,6 +229,7 @@ input Int64Filter {
 
 input FloatFilter {
 	eq: Float
+	in: [Float]
 	le: Float
 	lt: Float
 	ge: Float
@@ -234,6 +239,7 @@ input FloatFilter {
 
 input DateTimeFilter {
 	eq: DateTime
+	in: [DateTime]
 	le: DateTime
 	lt: DateTime
 	ge: DateTime
@@ -286,6 +292,8 @@ type AddPostPayload {
 
 type AuthorAggregateResult {
 	count: Int
+	nameMin: String
+	nameMax: String
 }
 
 type DeleteAuthorPayload {
@@ -302,6 +310,10 @@ type DeletePostPayload {
 
 type PostAggregateResult {
 	count: Int
+	titleMin: String
+	titleMax: String
+	textMin: String
+	textMax: String
 }
 
 type UpdateAuthorPayload {
@@ -353,7 +365,7 @@ input AddPostInput {
 
 input AuthorFilter {
 	id: [ID!]
-	has: AuthorHasFilter
+	has: [AuthorHasFilter]
 	and: [AuthorFilter]
 	or: [AuthorFilter]
 	not: AuthorFilter
@@ -376,7 +388,7 @@ input AuthorRef {
 
 input PostFilter {
 	id: [ID!]
-	has: PostHasFilter
+	has: [PostHasFilter]
 	and: [PostFilter]
 	or: [PostFilter]
 	not: PostFilter

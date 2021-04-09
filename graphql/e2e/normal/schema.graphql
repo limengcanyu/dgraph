@@ -21,6 +21,7 @@ type State {
         xcode: String! @id @search(by: [regexp])
         name: String!
         capital: String
+        region: Region
         country: Country
 }
 
@@ -105,11 +106,20 @@ interface Character {
 }
 
 type Human implements Character & Employee {
+        id: ID!
+        name: String! @search(by: [exact])
+        appearsIn: [Episode!] @search
+        bio: String @lambda
+        ename: String!
         starships: [Starship]
         totalCredits: Float
 }
 
 type Droid implements Character {
+        id: ID!
+        name: String! @search(by: [exact])
+        appearsIn: [Episode!] @search
+        bio: String @lambda
         primaryFunction: String
 }
 
@@ -153,8 +163,15 @@ type Student implements People {
 }
 
 type Person @withSubscription{
-    id: ID!
-    name: String!
+        id: ID!
+        name: String! @search(by: [hash])
+        nameHi: String @dgraph(pred:"Person.name@hi") @search(by: [hash])
+        nameZh: String @dgraph(pred:"Person.name@zh") @search(by: [hash])
+        nameHiZh: String @dgraph(pred:"Person.name@hi:zh")
+        nameZhHi: String @dgraph(pred:"Person.name@zh:hi")
+        nameHi_Zh_Untag: String @dgraph(pred:"Person.name@hi:zh:.")
+        name_Untag_AnyLang: String @dgraph(pred:"Person.name@.") @search(by: [hash])
+        professionEn: String @dgraph(pred:"Person.profession@en")
 }
 
 """
@@ -186,12 +203,18 @@ type Comment1 {
       replies: [Comment1]
 }
 
+type author1{
+      name:String! @id @search(by: [regexp])
+      posts:[post1] @hasInverse(field: author)
+}
+
 type post1{
         id: ID
         title: String! @id @search(by: [regexp])
         numLikes: Int64 @search
         commentsByMonth: [Int]
         likesByMonth: [Int64]
+        author:author1 @hasInverse(field: posts)
 }
 
 type Person1 {
@@ -274,4 +297,92 @@ type University @generate(
         id: ID!
         name: String!
         numStudents: Int
+}
+
+# @id directive with multiple data types
+type Book {
+        bookId: Int64! @id
+        name: String!
+        desc: String
+        summary: String @lambda
+        chapters: [Chapter] @hasInverse(field: book)
+}
+
+type Chapter {
+        chapterId: Int! @id
+        name: String!
+        book: Book
+}
+
+# multiple fields with @id directive
+type Worker {
+        name: String!
+        reg_No: Int! @id
+        emp_Id: String! @id
+}
+
+type Employer {
+        company: String! @id
+        worker: [Worker]
+}
+
+# sample data: https://github.com/mandiwise/space-camp-federation-demo/blob/master/db.json
+type Mission @key(fields: "id") {
+    id: String! @id
+    crew: [Astronaut] @provides(fields: "name") @hasInverse(field: missions)
+    spaceShip: [SpaceShip]
+    designation: String!
+    startDate: String
+    endDate: String
+}
+
+type Astronaut @key(fields: "id") @extends {
+    id: ID! @external
+    name: String! @external
+    age: Int @external
+    isActive: Boolean
+    bio: String @requires(fields: "name age") @lambda
+    missions: [Mission]
+}
+
+type SpaceShip @key(fields: "id") @extends {
+    id: String! @id @external
+    missions: [Mission]
+}
+
+type Planet @key(fields: "id") @extends {
+        id: Int! @id @external
+        missions: [Mission]
+}
+
+type Region {
+        id: String! @id
+        name: String!
+        district: District
+}
+
+type District @lambdaOnMutate(add: true, update: true, delete: true) {
+        dgId: ID!
+        id: String! @id
+        name: String!
+}
+
+type Owner {
+        username: String! @id
+        password: String!
+        projects: [Project!] @hasInverse(field: owner)
+}
+
+type Project {
+        id: String! @id
+        owner: Owner!
+        name: String! @search(by: [hash])
+        datasets: [Dataset!] @hasInverse(field: project)
+}
+
+type Dataset {
+        id: String! @id
+        owner: Owner!
+        project: Project!
+        name: String! @search(by: [hash])
 }

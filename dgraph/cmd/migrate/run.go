@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Dgraph Labs, Inc. and Contributors
+ * Copyright 2021 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,14 +39,16 @@ var (
 func init() {
 	Migrate.Cmd = &cobra.Command{
 		Use:   "migrate",
-		Short: "Run the Dgraph migrate tool",
+		Short: "Run the Dgraph migration tool from a MySQL database to Dgraph",
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := run(Migrate.Conf); err != nil {
 				logger.Fatalf("%v\n", err)
 			}
 		},
+		Annotations: map[string]string{"group": "tool"},
 	}
 	Migrate.EnvPrefix = "DGRAPH_MIGRATE"
+	Migrate.Cmd.SetHelpTemplate(x.NonRootTemplate)
 
 	flag := Migrate.Cmd.Flags()
 	flag.StringP("user", "", "", "The user for logging in")
@@ -54,8 +56,8 @@ func init() {
 	flag.StringP("db", "", "", "The database to import")
 	flag.StringP("tables", "", "", "The comma separated list of "+
 		"tables to import, an empty string means importing all tables in the database")
-	flag.StringP("output-schema", "s", "schema.txt", "The schema output file")
-	flag.StringP("output-data", "o", "sql.rdf", "The data output file")
+	flag.StringP("output_schema", "s", "schema.txt", "The schema output file")
+	flag.StringP("output_data", "o", "sql.rdf", "The data output file")
 	flag.StringP("separator", "p", ".", "The separator for constructing predicate names")
 	flag.BoolP("quiet", "q", false, "Enable quiet mode to suppress the warning logs")
 	flag.StringP("host", "", "localhost", "The hostname or IP address of the database server.")
@@ -67,8 +69,8 @@ func run(conf *viper.Viper) error {
 	db := conf.GetString("db")
 	password := conf.GetString("password")
 	tables := conf.GetString("tables")
-	schemaOutput := conf.GetString("output-schema")
-	dataOutput := conf.GetString("output-data")
+	schemaOutput := conf.GetString("output_schema")
+	dataOutput := conf.GetString("output_data")
 	host := conf.GetString("host")
 	port := conf.GetString("port")
 	quiet = conf.GetBool("quiet")
@@ -82,10 +84,10 @@ func run(conf *viper.Viper) error {
 	case len(password) == 0:
 		logger.Fatalf("The password property should not be empty.")
 	case len(schemaOutput) == 0:
-		logger.Fatalf("Please use the --output-schema option to " +
+		logger.Fatalf("Please use the --output_schema option to " +
 			"provide the schema output file.")
 	case len(dataOutput) == 0:
-		logger.Fatalf("Please use the --output-data option to provide the data output file.")
+		logger.Fatalf("Please use the --output_data option to provide the data output file.")
 	}
 
 	if err := checkFile(schemaOutput); err != nil {

@@ -27,22 +27,24 @@ var (
 	CmdAcl x.SubCommand
 )
 
-const gName = "guardian-name"
-const gPassword = "guardian-password"
 const defaultGroupList = "dgraph-unused-group"
 
 func init() {
 	CmdAcl.Cmd = &cobra.Command{
-		Use:   "acl",
-		Short: "Run the Dgraph acl tool",
+		Use:         "acl",
+		Short:       "Run the Dgraph Enterprise Edition ACL tool",
+		Annotations: map[string]string{"group": "security"},
 	}
-
+	CmdAcl.Cmd.SetHelpTemplate(x.NonRootTemplate)
 	flag := CmdAcl.Cmd.PersistentFlags()
 	flag.StringP("alpha", "a", "127.0.0.1:9080", "Dgraph Alpha gRPC server address")
-	flag.StringP(gName, "w", x.GrootId, "Guardian username performing this operation")
-	flag.StringP(gPassword, "x", "", "Guardian password to authorize this operation")
+	flag.String("guardian-creds", "", `Login credentials for the guardian
+	user defines the username to login.
+	password defines the password of the user.
+	namespace defines the namespace to log into.
+	Sample flag could look like --guardian-creds user=username;password=mypass;namespace=2`)
 
-	// TLS configuration
+	// --tls SuperFlag
 	x.RegisterClientTLSFlags(flag)
 
 	subcommands := initSubcommands()
@@ -108,8 +110,8 @@ func initSubcommands() []*x.SubCommand {
 
 	modFlags := cmdMod.Cmd.Flags()
 	modFlags.StringP("user", "u", "", "The user id to be changed")
-	modFlags.BoolP("new-password", "n", false, "Whether to reset password for the user")
-	modFlags.StringP("group-list", "l", defaultGroupList,
+	modFlags.BoolP("new_password", "n", false, "Whether to reset password for the user")
+	modFlags.StringP("group_list", "l", defaultGroupList,
 		"The list of groups to be set for the user")
 	modFlags.StringP("group", "g", "", "The group whose permission is to be changed")
 	modFlags.StringP("pred", "p", "", "The predicates whose acls are to be changed")

@@ -13,12 +13,13 @@
 package zero
 
 import (
-	"bytes"
 	"context"
 	"io/ioutil"
 	"math"
 	"net/http"
 	"time"
+
+	"github.com/dgraph-io/dgraph/ee/audit"
 
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
@@ -70,12 +71,21 @@ func (n *node) updateEnterpriseState(closer *z.Closer) {
 
 	intervalsInDay := int64(24*time.Hour) / int64(interval)
 	var counter int64
+	crashLearner := func() {
+		if n.RaftContext.IsLearner {
+			glog.Errorf("Enterprise License missing or expired. " +
+				"Learner nodes need an Enterprise License.")
+			// Signal the zero node to stop.
+			n.server.closer.Signal()
+		}
+	}
 	for {
 		select {
 		case <-ticker.C:
 			counter++
 			license := n.server.license()
 			if !license.GetEnabled() {
+				crashLearner()
 				continue
 			}
 
@@ -91,9 +101,12 @@ func (n *node) updateEnterpriseState(closer *z.Closer) {
 			active := time.Now().UTC().Before(expiry)
 			if !active {
 				n.server.expireLicense()
+				audit.Close()
+
 				glog.Warningf("Your enterprise license has expired and enterprise features are " +
-					"disabled. To continue using enterprise features, apply a valid license. To receive " +
-					"a new license, contact us at https://dgraph.io/contact.")
+					"disabled. To continue using enterprise features, apply a valid license. " +
+					"To receive a new license, contact us at https://dgraph.io/contact.")
+				crashLearner()
 			}
 		case <-closer.HasBeenClosed():
 			return
@@ -125,7 +138,7 @@ func (st *state) applyEnterpriseLicense(w http.ResponseWriter, r *http.Request) 
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if err := st.zero.applyLicense(ctx, bytes.NewReader(b)); err != nil {
+	if _, err := st.zero.ApplyLicense(ctx, &pb.ApplyLicenseRequest{License: b}); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		x.SetStatus(w, x.ErrorInvalidRequest, err.Error())
 		return
@@ -143,7 +156,7 @@ func (s *Server) applyLicenseFile(path string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if err = s.applyLicense(ctx, bytes.NewReader(content)); err != nil {
+	if _, err = s.ApplyLicense(ctx, &pb.ApplyLicenseRequest{License: content}); err != nil {
 		glog.Infof("Unable to apply license at %v due to error %v", path, err)
 	}
 }

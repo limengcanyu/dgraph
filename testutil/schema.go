@@ -36,13 +36,9 @@ const (
 `
 	otherInternalPreds = `
 {"predicate":"dgraph.type","type":"string","index":true,"tokenizer":["exact"],"list":true},
-{"predicate":"dgraph.cors","type":"string","list":true,"type":"string","index":true,"tokenizer":["exact"],"upsert":true},
 {"predicate":"dgraph.drop.op", "type": "string"},
-{"predicate":"dgraph.graphql.p_query","type":"string"},
-{"predicate":"dgraph.graphql.p_sha256hash","type":"string","index":true,"tokenizer":["exact"]},
+{"predicate":"dgraph.graphql.p_query","type":"string","index":true,"tokenizer":["sha256"]},
 {"predicate":"dgraph.graphql.schema", "type": "string"},
-{"predicate":"dgraph.graphql.schema_history", "type": "string"},
-{"predicate":"dgraph.graphql.schema_created_at", "type": "datetime"},
 {"predicate":"dgraph.graphql.xid","type":"string","index":true,"tokenizer":["exact"],"upsert":true}
 `
 	aclTypes = `
@@ -62,10 +58,7 @@ const (
 	"fields": [{"name": "dgraph.graphql.schema"},{"name": "dgraph.graphql.xid"}],
 	"name": "dgraph.graphql"
 },{
-	"fields": [{"name": "dgraph.graphql.schema_history"},{"name": "dgraph.graphql.schema_created_at"}],
-	"name": "dgraph.graphql.history"
-},{
-	"fields": [{"name": "dgraph.graphql.p_query"},{"name": "dgraph.graphql.p_sha256hash"}],
+	"fields": [{"name": "dgraph.graphql.p_query"}],
 	"name": "dgraph.graphql.persisted_query"
 }
 `
@@ -132,7 +125,7 @@ func GetFullSchemaHTTPResponse(opts SchemaOptions) string {
 // VerifySchema verifies that the full schema generated using user provided predicates and types is
 // same as the response of the schema{} query.
 func VerifySchema(t *testing.T, dg *dgo.Dgraph, opts SchemaOptions) {
-	resp, err := dg.NewTxn().Query(context.Background(), `schema {}`)
+	resp, err := dg.NewReadOnlyTxn().Query(context.Background(), `schema {}`)
 	require.NoError(t, err)
 
 	CompareJSON(t, GetFullSchemaJSON(opts), string(resp.GetJson()))

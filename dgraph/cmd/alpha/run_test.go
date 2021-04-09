@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -79,7 +80,7 @@ func processToFastJSON(q string) string {
 		log.Fatal(err)
 	}
 
-	buf, err := query.ToJson(&l, qr.Subgraphs)
+	buf, err := query.ToJson(context.Background(), &l, qr.Subgraphs, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1379,7 +1380,7 @@ func TestGrpcCompressionSupport(t *testing.T) {
 	require.NoError(t, err)
 
 	dc := dgo.NewDgraphClient(api.NewDgraphClient(conn))
-	dc.Login(context.Background(), x.GrootId, "password")
+	dc.LoginIntoNamespace(context.Background(), x.GrootId, "password", x.GalaxyNamespace)
 	q := `schema {}`
 	tx := dc.NewTxn()
 	_, err = tx.Query(context.Background(), q)
@@ -1655,10 +1656,35 @@ func TestGeoValidWkbData(t *testing.T) {
 
 var addr string
 
-// the grootAccessJWT stores the access JWT extracted from the response
-// of http login
-var grootAccessJwt string
-var grootRefreshJwt string
+type Token struct {
+	token *testutil.HttpToken
+	sync.RWMutex
+}
+
+//// the grootAccessJWT stores the access JWT extracted from the response
+//// of http login
+var token *Token
+
+func (t *Token) getAccessJWTToken() string {
+	t.RLock()
+	defer t.RUnlock()
+	return t.token.AccessJwt
+}
+
+func (t *Token) refreshToken() error {
+	t.Lock()
+	defer t.Unlock()
+	newToken, err := testutil.HttpLogin(&testutil.LoginParams{
+		Endpoint:   addr + "/admin",
+		RefreshJwt: t.token.RefreshToken,
+	})
+	if err != nil {
+		return err
+	}
+	t.token.AccessJwt = newToken.AccessJwt
+	t.token.RefreshToken = newToken.RefreshToken
+	return nil
+}
 
 func TestMain(m *testing.M) {
 	addr = "http://" + testutil.SockAddrHttp
@@ -1668,11 +1694,15 @@ func TestMain(m *testing.M) {
 		log.Fatal(err)
 	}
 	zc := pb.NewZeroClient(conn)
-	if _, err := zc.AssignUids(context.Background(), &pb.Num{Val: 1e6}); err != nil {
+	if _, err := zc.AssignIds(context.Background(),
+		&pb.Num{Val: 1e6, Type: pb.Num_UID}); err != nil {
 		log.Fatal(err)
 	}
-	grootAccessJwt, grootRefreshJwt = testutil.GrootHttpLogin(addr + "/admin")
-
+	httpToken := testutil.GrootHttpLogin(addr + "/admin")
+	token = &Token{
+		token:   httpToken,
+		RWMutex: sync.RWMutex{},
+	}
 	r := m.Run()
 	os.Exit(r)
 }

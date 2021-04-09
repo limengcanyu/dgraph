@@ -67,7 +67,7 @@ func runGzipWithRetry(contentType, url string, buf io.Reader, gzReq, gzResp bool
 			return nil, err
 		}
 		req.Header.Add("Content-Type", contentType)
-		req.Header.Set("X-Dgraph-AccessToken", grootAccessJwt)
+		req.Header.Set("X-Dgraph-AccessToken", token.getAccessJWTToken())
 
 		if gzReq {
 			req.Header.Set("Content-Encoding", "gzip")
@@ -79,11 +79,7 @@ func runGzipWithRetry(contentType, url string, buf io.Reader, gzReq, gzResp bool
 
 		resp, err = client.Do(req)
 		if err != nil && strings.Contains(err.Error(), "Token is expired") {
-			grootAccessJwt, grootRefreshJwt, err = testutil.HttpLogin(&testutil.LoginParams{
-				Endpoint:   addr + "/admin",
-				RefreshJwt: grootRefreshJwt,
-			})
-
+			err := token.refreshToken()
 			if err != nil {
 				return nil, err
 			}
@@ -167,33 +163,8 @@ func queryWithGz(queryText, contentType, debug, timeout string, gzReq, gzResp bo
 }
 
 func queryWithTs(queryText, contentType, debug string, ts uint64) (string, uint64, error) {
-	params := make([]string, 0, 2)
-	if debug != "" {
-		params = append(params, "debug="+debug)
-	}
-	if ts != 0 {
-		params = append(params, fmt.Sprintf("startTs=%v", strconv.FormatUint(ts, 10)))
-	}
-	url := addr + "/query?" + strings.Join(params, "&")
-
-	_, body, err := runWithRetries("POST", contentType, url, queryText)
-	if err != nil {
-		return "", 0, err
-	}
-
-	var r res
-	if err := json.Unmarshal(body, &r); err != nil {
-		return "", 0, err
-	}
-	startTs := r.Extensions.Txn.StartTs
-
-	// Remove the extensions.
-	r2 := res{
-		Data: r.Data,
-	}
-	output, err := json.Marshal(r2)
-
-	return string(output), startTs, err
+	out, startTs, _, err := queryWithTsForResp(queryText, contentType, debug, ts)
+	return out, startTs, err
 }
 
 // queryWithTsForResp query the dgraph and returns it's http response and result.
@@ -295,92 +266,14 @@ func createRequest(method, contentType, url string, body string) (*http.Request,
 
 func runWithRetries(method, contentType, url string, body string) (
 	*x.QueryResWithData, []byte, error) {
-
-	req, err := createRequest(method, contentType, url, body)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	qr, respBody, err := runRequest(req)
-	if err != nil && strings.Contains(err.Error(), "Token is expired") {
-		grootAccessJwt, grootRefreshJwt, err = testutil.HttpLogin(&testutil.LoginParams{
-			Endpoint:   addr + "/admin",
-			RefreshJwt: grootRefreshJwt,
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// create a new request since the previous request would have been closed upon the err
-		retryReq, err := createRequest(method, contentType, url, body)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		return runRequest(retryReq)
-	}
+	qr, respBody, _, err := runWithRetriesForResp(method, contentType, url, body)
 	return qr, respBody, err
 }
 
 // attach the grootAccessJWT to the request and sends the http request
-func runRequest(req *http.Request) (*x.QueryResWithData, []byte, error) {
+func runRequest(req *http.Request) (*x.QueryResWithData, []byte, *http.Response, error) {
 	client := &http.Client{}
-	req.Header.Set("X-Dgraph-AccessToken", grootAccessJwt)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, nil, err
-	}
-	if status := resp.StatusCode; status != http.StatusOK {
-		return nil, nil, errors.Errorf("Unexpected status code: %v", status)
-	}
-
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, errors.Errorf("unable to read from body: %v", err)
-	}
-
-	qr := new(x.QueryResWithData)
-	json.Unmarshal(body, qr) // Don't check error.
-	if len(qr.Errors) > 0 {
-		return nil, nil, errors.New(qr.Errors[0].Message)
-	}
-	return qr, body, nil
-}
-
-func runWithRetriesForResp(method, contentType, url string, body string) (
-	*x.QueryResWithData, []byte, *http.Response, error) {
-
-	req, err := createRequest(method, contentType, url, body)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	qr, respBody, resp, err := runRequestForResp(req)
-	if err != nil && strings.Contains(err.Error(), "Token is expired") {
-		grootAccessJwt, grootRefreshJwt, err = testutil.HttpLogin(&testutil.LoginParams{
-			Endpoint:   addr + "/admin",
-			RefreshJwt: grootRefreshJwt,
-		})
-		if err != nil {
-			return nil, nil, nil, err
-		}
-
-		// create a new request since the previous request would have been closed upon the err
-		retryReq, err := createRequest(method, contentType, url, body)
-		if err != nil {
-			return nil, nil, resp, err
-		}
-
-		return runRequestForResp(retryReq)
-	}
-	return qr, respBody, resp, err
-}
-
-// attach the grootAccessJWT to the request and sends the http request
-func runRequestForResp(req *http.Request) (*x.QueryResWithData, []byte, *http.Response, error) {
-	client := &http.Client{}
-	req.Header.Set("X-Dgraph-AccessToken", grootAccessJwt)
+	req.Header.Set("X-Dgraph-AccessToken", token.getAccessJWTToken())
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, resp, err
@@ -403,10 +296,43 @@ func runRequestForResp(req *http.Request) (*x.QueryResWithData, []byte, *http.Re
 	return qr, body, resp, nil
 }
 
-func commitWithTs(keys, preds []string, ts uint64) error {
+func runWithRetriesForResp(method, contentType, url string, body string) (
+	*x.QueryResWithData, []byte, *http.Response, error) {
+
+	req, err := createRequest(method, contentType, url, body)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	qr, respBody, resp, err := runRequest(req)
+	if err != nil && strings.Contains(err.Error(), "Token is expired") {
+		err = token.refreshToken()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		// create a new request since the previous request would have been closed upon the err
+		retryReq, err := createRequest(method, contentType, url, body)
+		if err != nil {
+			return nil, nil, resp, err
+		}
+
+		return runRequest(retryReq)
+	}
+	return qr, respBody, resp, err
+}
+
+func commitWithTs(keys, preds []string, ts uint64, abort bool) error {
 	url := addr + "/commit"
 	if ts != 0 {
 		url += "?startTs=" + strconv.FormatUint(ts, 10)
+	}
+	if abort {
+		if ts != 0 {
+			url += "&abort=true"
+		} else {
+			url += "?abort=true"
+		}
 	}
 
 	m := make(map[string]interface{})
@@ -420,7 +346,7 @@ func commitWithTs(keys, preds []string, ts uint64) error {
 	if err != nil {
 		return err
 	}
-	_, _, err = runRequest(req)
+	_, _, _, err = runRequest(req)
 	return err
 }
 
@@ -438,7 +364,7 @@ func commitWithTsKeysOnly(keys []string, ts uint64) error {
 	if err != nil {
 		return err
 	}
-	_, _, err = runRequest(req)
+	_, _, _, err = runRequest(req)
 	return err
 }
 
@@ -475,7 +401,8 @@ func TestTransactionBasic(t *testing.T) {
 	require.Equal(t, 2, len(mr.preds))
 	var parsedPreds []string
 	for _, pred := range mr.preds {
-		parsedPreds = append(parsedPreds, strings.Join(strings.Split(pred, "-")[1:], "-"))
+		p := strings.Split(pred, "-")[1]
+		parsedPreds = append(parsedPreds, x.ParseAttr(p))
 	}
 	sort.Strings(parsedPreds)
 	require.Equal(t, "balance", parsedPreds[0])
@@ -491,7 +418,7 @@ func TestTransactionBasic(t *testing.T) {
 	require.Equal(t, `{"data":{"balances":[{"name":"Bob","balance":"110"}]}}`, data)
 
 	// Commit and query.
-	require.NoError(t, commitWithTs(mr.keys, mr.preds, ts))
+	require.NoError(t, commitWithTs(mr.keys, mr.preds, ts, false))
 	data, _, err = queryWithTs(q1, "application/dql", "", 0)
 	require.NoError(t, err)
 	require.Equal(t, `{"data":{"balances":[{"name":"Bob","balance":"110"}]}}`, data)
@@ -537,7 +464,7 @@ func TestTransactionBasicNoPreds(t *testing.T) {
 	require.Equal(t, `{"data":{"balances":[{"name":"Bob","balance":"110"}]}}`, data)
 
 	// Commit and query.
-	require.NoError(t, commitWithTs(mr.keys, nil, ts))
+	require.NoError(t, commitWithTs(mr.keys, nil, ts, false))
 	data, _, err = queryWithTs(q1, "application/dql", "", 0)
 	require.NoError(t, err)
 	require.Equal(t, `{"data":{"balances":[{"name":"Bob","balance":"110"}]}}`, data)
@@ -632,7 +559,7 @@ func TestTransactionBasicOldCommitFormat(t *testing.T) {
 	url := fmt.Sprintf("%s/commit?startTs=%d&abort=true", addr, ts)
 	req, err := http.NewRequest("POST", url, nil)
 	require.NoError(t, err)
-	_, _, err = runRequest(req)
+	_, _, _, err = runRequest(req)
 	require.NoError(t, err)
 }
 
@@ -649,7 +576,21 @@ func TestAlterAllFieldsShouldBeSet(t *testing.T) {
 	var qr x.QueryResWithData
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &qr))
 	require.Len(t, qr.Errors, 1)
-	require.Equal(t, qr.Errors[0].Extensions["code"], "Error")
+	require.Equal(t, "Error", qr.Errors[0].Extensions["code"])
+}
+
+// This test is a basic sanity test to check nothing breaks in the alter API.
+func TestAlterSanity(t *testing.T) {
+	ops := []string{`{"drop_attr": "name"}`,
+		`{"drop_op": "TYPE", "drop_value": "Film"}`,
+		`{"drop_op": "DATA"}`,
+		`{"drop_all":true}`}
+
+	for _, op := range ops {
+		qr, _, err := runWithRetries("PUT", "", addr+"/alter", op)
+		require.NoError(t, err)
+		require.Len(t, qr.Errors, 0)
+	}
 }
 
 func TestHttpCompressionSupport(t *testing.T) {
@@ -720,8 +661,8 @@ func TestHttpCompressionSupport(t *testing.T) {
 	require.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
 
 	// query with timeout
-	data, _, err = queryWithGz(q1, "application/dql", "", "1ms", false, false)
-	require.EqualError(t, err, ": context deadline exceeded")
+	data, _, err = queryWithGz(q1, "application/dql", "", "100us", false, false)
+	requireDeadline(t, err)
 	require.Equal(t, "", data)
 
 	data, resp, err = queryWithGz(q1, "application/dql", "", "1s", false, false)
@@ -747,6 +688,13 @@ func TestHttpCompressionSupport(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, `{"data":{"names":[{"name":"Alice"}]}}`, data)
 	require.Empty(t, resp.Header.Get("Content-Encoding"))
+}
+
+func requireDeadline(t *testing.T, err error) {
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Logf("Got error: %v when expecting context deadline exceeded", err)
+		t.Fail()
+	}
 }
 
 func TestDebugSupport(t *testing.T) {
@@ -821,18 +769,18 @@ func TestDebugSupport(t *testing.T) {
 	require.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
 
 	// query with timeout
-	data, _, err = queryWithGz(q1, "application/dql", "true", "1ms", false, false)
-	require.EqualError(t, err, ": context deadline exceeded")
+	data, _, err = queryWithGz(q1, "application/dql", "true", "100us", false, false)
+	requireDeadline(t, err)
 	require.Equal(t, "", data)
 
-	data, resp, err = queryWithGz(q1, "application/dql", "true", "1s", false, false)
+	data, resp, err = queryWithGz(q1, "application/dql", "true", "3s", false, false)
 	require.NoError(t, err)
 	requireEqual(t, data)
 	require.Empty(t, resp.Header.Get("Content-Encoding"))
 
 	d1, err := json.Marshal(params{Query: q1})
 	require.NoError(t, err)
-	data, resp, err = queryWithGz(string(d1), "application/json", "true", "1s", false, false)
+	data, resp, err = queryWithGz(string(d1), "application/json", "true", "3s", false, false)
 	require.NoError(t, err)
 	requireEqual(t, data)
 	require.Empty(t, resp.Header.Get("Content-Encoding"))
@@ -915,12 +863,12 @@ func TestDrainingMode(t *testing.T) {
 
 	}
 
-	grootJwt, _ := testutil.GrootHttpLogin(addr + "/admin")
+	token := testutil.GrootHttpLogin(addr + "/admin")
 
-	setDrainingMode(t, true, grootJwt)
+	setDrainingMode(t, true, token.AccessJwt)
 	runRequests(true)
 
-	setDrainingMode(t, false, grootJwt)
+	setDrainingMode(t, false, token.AccessJwt)
 	runRequests(false)
 }
 

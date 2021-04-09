@@ -25,11 +25,10 @@ import (
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
 
-	badgerpb "github.com/dgraph-io/badger/v2/pb"
+	badgerpb "github.com/dgraph-io/badger/v3/pb"
 	"github.com/dgraph-io/dgraph/edgraph"
 	"github.com/dgraph-io/dgraph/graphql/resolve"
 	"github.com/dgraph-io/dgraph/graphql/schema"
-	"github.com/dgraph-io/dgraph/graphql/web"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/query"
 	"github.com/dgraph-io/dgraph/worker"
@@ -40,13 +39,29 @@ import (
 const (
 	errMsgServerNotReady = "Unavailable: Server not ready."
 
-	errNoGraphQLSchema = "Not resolving %s. There's no GraphQL schema in Dgraph.  " +
+	errNoGraphQLSchema = "Not resolving %s. There's no GraphQL schema in Dgraph. " +
 		"Use the /admin API to add a GraphQL schema"
 	errResolverNotFound = "%s was not executed because no suitable resolver could be found - " +
 		"this indicates a resolver or validation bug. Please let us know by filing an issue."
 
 	// GraphQL schema for /admin endpoint.
 	graphqlAdminSchema = `
+	"""
+	The Int64 scalar type represents a signed 64‐bit numeric non‐fractional value.
+	Int64 can represent values in range [-(2^63),(2^63 - 1)].
+	"""
+	scalar Int64
+
+    """
+	The UInt64 scalar type represents an unsigned 64‐bit numeric non‐fractional value.
+	UInt64 can represent values in range [0,(2^64 - 1)].
+	""" 
+    scalar UInt64
+	
+	"""
+	The DateTime scalar type represents date and time as a string in RFC3339 format.
+	For example: "1985-04-12T23:20:50.52Z" represents 20 minutes and 50.52 seconds after the 23rd hour of April 12th, 1985 in UTC.
+	"""
 	scalar DateTime
 
 	"""
@@ -65,26 +80,6 @@ const (
 		This is the schema that is being served by Dgraph at /graphql.
 		"""
 		generatedSchema: String!
-	}
-
-	type Cors @dgraph(type: "dgraph.cors"){
-		acceptedOrigins: [String]
-	}
-
-	"""
-	SchemaHistory contains the schema and the time when the schema has been created.
-	"""
-	type SchemaHistory @dgraph(type: "dgraph.graphql.history") {
-		schema: String! @id @dgraph(pred: "dgraph.graphql.schema_history")
-		created_at: DateTime! @dgraph(pred: "dgraph.graphql.schema_created_at")
-	}
-
-	"""
-	PersistedQuery contains the query and sha256hash of the query.
-	"""
-	type PersistedQuery @dgraph(type: "dgraph.graphql.persisted_query") {
-		query: String! @dgraph(pred: "dgraph.graphql.p_query")
-		sha256Hash: String! @id @dgraph(pred: "dgraph.graphql.p_sha256hash")
 	}
 
 	"""
@@ -121,12 +116,12 @@ const (
 		"""
 		Time in nanoseconds since the node started.
 		"""
-		uptime: Int
+		uptime: Int64
 
 		"""
 		Time in Unix epoch time that the node was last contacted by another Zero or Alpha node.
 		"""
-		lastEcho: Int
+		lastEcho: Int64
 
 		"""
 		List of ongoing operations in the background.
@@ -145,50 +140,51 @@ const (
 	}
 
 	type MembershipState {
-		counter: Int
+		counter: UInt64
 		groups: [ClusterGroup]
 		zeros: [Member]
-		maxLeaseId: Int
-		maxTxnTs: Int
-		maxRaftId: Int
+		maxUID: UInt64
+		maxNsID: UInt64
+		maxTxnTs: UInt64
+		maxRaftId: UInt64
 		removed: [Member]
 		cid: String
 		license: License
 	}
 
 	type ClusterGroup {
-		id: Int
+		id: UInt64
 		members: [Member]
 		tablets: [Tablet]
-		snapshotTs: Int
-		checksum: Int
+		snapshotTs: UInt64
+		checksum: UInt64
 	}
 
 	type Member {
-		id: Int
-		groupId: Int
+		id: UInt64
+		groupId: UInt64
 		addr: String
 		leader: Boolean
 		amDead: Boolean
-		lastUpdate: Int
+		lastUpdate: UInt64
 		clusterInfoOnly: Boolean
 		forceGroupId: Boolean
 	}
 
 	type Tablet {
-		groupId: Int
+		groupId: UInt64
 		predicate: String
 		force: Boolean
 		space: Int
 		remove: Boolean
 		readOnly: Boolean
-		moveTs: Int
+		moveTs: UInt64
 	}
 
 	type License {
 		user: String
-		maxNodes: Int
-		expiryTs: Int
+		maxNodes: UInt64
+		expiryTs: Int64
 		enabled: Boolean
 	}
 
@@ -210,10 +206,19 @@ const (
 	}
 
 	input ExportInput {
+		"""
+		Data format for the export, e.g. "rdf" or "json" (default: "rdf")
+		"""
 		format: String
 
 		"""
-		Destination for the backup: e.g. Minio or S3 bucket or /absolute/path
+		Namespace for the export in multi-tenant cluster. Users from guardians of galaxy can export
+		all namespaces by passing a negative value or specific namespaceId to export that namespace.
+		"""
+		namespace: Int
+
+		"""
+		Destination for the export: e.g. Minio or S3 bucket or /absolute/path
 		"""
 		destination: String
 
@@ -260,7 +265,7 @@ const (
 		"""
 		Estimated memory the caches can take. Actual usage by the process would be
 		more than specified here. The caches will be updated according to the
-		cache-percentage flag.
+		cache_percentage flag.
 		"""
 		cacheMb: Float
 
@@ -279,6 +284,82 @@ const (
 		cacheMb: Float
 	}
 
+	input RemoveNodeInput {
+		"""
+		ID of the node to be removed.
+		"""
+		nodeId: UInt64!
+
+		"""
+		ID of the group from which the node is to be removed.
+		"""
+		groupId: UInt64!
+	}
+
+	type RemoveNodePayload {
+		response: Response
+	}
+
+	input MoveTabletInput {
+		"""
+		Namespace in which the predicate exists.
+		"""
+		namespace: UInt64
+
+		"""
+		Name of the predicate to move.
+		"""
+		tablet: String!
+
+		"""
+		ID of the destination group where the predicate is to be moved.
+		"""
+		groupId: UInt64!
+	}
+
+	type MoveTabletPayload {
+		response: Response
+	}
+
+	enum AssignKind {
+		UID
+		TIMESTAMP
+		NAMESPACE_ID
+	}
+
+	input AssignInput {
+		"""
+		Choose what to assign: UID, TIMESTAMP or NAMESPACE_ID.
+		"""
+		what: AssignKind!
+
+		"""
+		How many to assign.
+		"""
+		num: UInt64!
+	}
+
+	type AssignedIds {
+		"""
+		The first UID, TIMESTAMP or NAMESPACE_ID assigned.
+		"""
+		startId: UInt64
+
+		"""
+		The last UID, TIMESTAMP or NAMESPACE_ID assigned.
+		"""
+		endId: UInt64
+
+		"""
+		TIMESTAMP for read-only transactions.
+		"""
+		readOnly: UInt64
+	}
+
+	type AssignPayload {
+		response: AssignedIds
+	}
+
 	` + adminTypes + `
 
 	type Query {
@@ -286,8 +367,6 @@ const (
 		health: [NodeState]
 		state: MembershipState
 		config: Config
-		getAllowedCORSOrigins: Cors
-		querySchemaHistory(first: Int, offset: Int): [SchemaHistory]
 		` + adminQueries + `
 	}
 
@@ -321,7 +400,20 @@ const (
 		"""
 		config(input: ConfigInput!): ConfigPayload
 
-		replaceAllowedCORSOrigins(origins: [String]): Cors
+		"""
+		Remove a node from the cluster.
+		"""
+		removeNode(input: RemoveNodeInput!): RemoveNodePayload
+
+		"""
+		Move a predicate from one group to another.
+		"""
+		moveTablet(input: MoveTabletInput!): MoveTabletPayload
+
+		"""
+		Lease UIDs, Timestamps or Namespace IDs in advance.
+		"""
+		assign(input: AssignInput!): AssignPayload
 
 		` + adminMutations + `
 	}
@@ -329,67 +421,106 @@ const (
 )
 
 var (
-	// commonAdminQueryMWs are the middlewares which should be applied to queries served by admin
+	// gogQryMWs are the middlewares which should be applied to queries served by
+	// admin server for guardian of galaxy unless some exceptional behaviour is required
+	gogQryMWs = resolve.QueryMiddlewares{
+		resolve.IpWhitelistingMW4Query,
+		resolve.GuardianOfTheGalaxyAuthMW4Query,
+		resolve.LoggingMWQuery,
+	}
+	// gogMutMWs are the middlewares which should be applied to mutations
+	// served by admin server for guardian of galaxy unless some exceptional behaviour is required
+	gogMutMWs = resolve.MutationMiddlewares{
+		resolve.IpWhitelistingMW4Mutation,
+		resolve.GuardianOfTheGalaxyAuthMW4Mutation,
+		resolve.LoggingMWMutation,
+	}
+	// gogAclMutMWs are the middlewares which should be applied to mutations
+	// served by the admin server for guardian of galaxy with ACL enabled.
+	gogAclMutMWs = resolve.MutationMiddlewares{
+		resolve.IpWhitelistingMW4Mutation,
+		resolve.AclOnlyMW4Mutation,
+		resolve.GuardianOfTheGalaxyAuthMW4Mutation,
+		resolve.LoggingMWMutation,
+	}
+	// stdAdminQryMWs are the middlewares which should be applied to queries served by admin
 	// server unless some exceptional behaviour is required
-	commonAdminQueryMWs = resolve.QueryMiddlewares{
+	stdAdminQryMWs = resolve.QueryMiddlewares{
 		resolve.IpWhitelistingMW4Query, // good to apply ip whitelisting before Guardian auth
 		resolve.GuardianAuthMW4Query,
 		resolve.LoggingMWQuery,
 	}
-	// commonAdminMutationMWs are the middlewares which should be applied to mutations served by
+	// stdAdminMutMWs are the middlewares which should be applied to mutations served by
 	// admin server unless some exceptional behaviour is required
-	commonAdminMutationMWs = resolve.MutationMiddlewares{
+	stdAdminMutMWs = resolve.MutationMiddlewares{
 		resolve.IpWhitelistingMW4Mutation, // good to apply ip whitelisting before Guardian auth
 		resolve.GuardianAuthMW4Mutation,
 		resolve.LoggingMWMutation,
 	}
+	// minimalAdminQryMWs is the minimal set of middlewares that should be applied to any query
+	// served by the admin server
+	minimalAdminQryMWs = resolve.QueryMiddlewares{
+		resolve.IpWhitelistingMW4Query,
+		resolve.LoggingMWQuery,
+	}
+	// minimalAdminMutMWs is the minimal set of middlewares that should be applied to any mutation
+	// served by the admin server
+	minimalAdminMutMWs = resolve.MutationMiddlewares{
+		resolve.IpWhitelistingMW4Mutation,
+		resolve.LoggingMWMutation,
+	}
 	adminQueryMWConfig = map[string]resolve.QueryMiddlewares{
-		"health":        {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery}, // dgraph checks Guardian auth for health
-		"state":         {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery}, // dgraph checks Guardian auth for state
-		"config":        commonAdminQueryMWs,
-		"listBackups":   commonAdminQueryMWs,
-		"restoreStatus": commonAdminQueryMWs,
-		"getGQLSchema":  commonAdminQueryMWs,
+		"health":       minimalAdminQryMWs, // dgraph checks Guardian auth for health
+		"state":        minimalAdminQryMWs, // dgraph checks Guardian auth for state
+		"config":       stdAdminQryMWs,
+		"listBackups":  gogQryMWs,
+		"getGQLSchema": stdAdminQryMWs,
 		// for queries and mutations related to User/Group, dgraph handles Guardian auth,
 		// so no need to apply GuardianAuth Middleware
-		"queryGroup":            {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery},
-		"queryUser":             {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery},
-		"getGroup":              {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery},
-		"getCurrentUser":        {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery},
-		"getUser":               {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery},
-		"querySchemaHistory":    {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery},
-		"getAllowedCORSOrigins": {resolve.IpWhitelistingMW4Query, resolve.LoggingMWQuery},
+		"queryUser":      minimalAdminQryMWs,
+		"queryGroup":     minimalAdminQryMWs,
+		"getUser":        minimalAdminQryMWs,
+		"getCurrentUser": minimalAdminQryMWs,
+		"getGroup":       minimalAdminQryMWs,
 	}
 	adminMutationMWConfig = map[string]resolve.MutationMiddlewares{
-		"backup":          commonAdminMutationMWs,
-		"config":          commonAdminMutationMWs,
-		"draining":        commonAdminMutationMWs,
-		"export":          commonAdminMutationMWs,
-		"login":           {resolve.IpWhitelistingMW4Mutation, resolve.LoggingMWMutation},
-		"restore":         commonAdminMutationMWs,
-		"shutdown":        commonAdminMutationMWs,
-		"updateGQLSchema": commonAdminMutationMWs,
+		"backup":            gogMutMWs,
+		"config":            gogMutMWs,
+		"draining":          gogMutMWs,
+		"export":            stdAdminMutMWs, // dgraph handles the export for other namespaces by guardian of galaxy
+		"login":             minimalAdminMutMWs,
+		"restore":           gogMutMWs,
+		"shutdown":          gogMutMWs,
+		"removeNode":        gogMutMWs,
+		"moveTablet":        gogMutMWs,
+		"assign":            gogMutMWs,
+		"enterpriseLicense": gogMutMWs,
+		"updateGQLSchema":   stdAdminMutMWs,
+		"addNamespace":      gogAclMutMWs,
+		"deleteNamespace":   gogAclMutMWs,
+		"resetPassword":     gogAclMutMWs,
 		// for queries and mutations related to User/Group, dgraph handles Guardian auth,
 		// so no need to apply GuardianAuth Middleware
-		"addUser":                   {resolve.IpWhitelistingMW4Mutation, resolve.LoggingMWMutation},
-		"addGroup":                  {resolve.IpWhitelistingMW4Mutation, resolve.LoggingMWMutation},
-		"updateUser":                {resolve.IpWhitelistingMW4Mutation, resolve.LoggingMWMutation},
-		"updateGroup":               {resolve.IpWhitelistingMW4Mutation, resolve.LoggingMWMutation},
-		"deleteUser":                {resolve.IpWhitelistingMW4Mutation, resolve.LoggingMWMutation},
-		"deleteGroup":               {resolve.IpWhitelistingMW4Mutation, resolve.LoggingMWMutation},
-		"replaceAllowedCORSOrigins": {resolve.IpWhitelistingMW4Mutation, resolve.LoggingMWMutation},
+		"addUser":     minimalAdminMutMWs,
+		"addGroup":    minimalAdminMutMWs,
+		"updateUser":  minimalAdminMutMWs,
+		"updateGroup": minimalAdminMutMWs,
+		"deleteUser":  minimalAdminMutMWs,
+		"deleteGroup": minimalAdminMutMWs,
 	}
 	// mainHealthStore stores the health of the main GraphQL server.
 	mainHealthStore = &GraphQLHealthStore{}
+	// adminServerVar stores a pointer to the adminServer. It is used for lazy loading schema.
+	adminServerVar *adminServer
 )
 
 func SchemaValidate(sch string) error {
-	schHandler, err := schema.NewHandler(sch, true)
+	schHandler, err := schema.NewHandler(sch, false)
 	if err != nil {
 		return err
 	}
 
-	_, err = schema.FromString(schHandler.GQLSchema())
+	_, err = schema.FromString(schHandler.GQLSchema(), x.GalaxyNamespace)
 	return err
 }
 
@@ -424,7 +555,9 @@ func (g *GraphQLHealthStore) updatingSchema() {
 type gqlSchema struct {
 	ID              string `json:"id,omitempty"`
 	Schema          string `json:"schema,omitempty"`
+	Version         uint64
 	GeneratedSchema string
+	loaded          bool // This indicate whether the schema has been loaded into graphql server or not
 }
 
 type adminServer struct {
@@ -432,31 +565,33 @@ type adminServer struct {
 	resolver *resolve.RequestResolver
 
 	// The mutex that locks schema update operations
-	mux sync.Mutex
+	mux sync.RWMutex
 
 	// The GraphQL server that's being admin'd
-	gqlServer web.IServeGraphQL
+	gqlServer IServeGraphQL
 
-	schema *gqlSchema
+	schema map[uint64]*gqlSchema
 
 	// When the schema changes, we use these to create a new RequestResolver for
 	// the main graphql endpoint (gqlServer) and thus refresh the API.
 	fns               *resolve.ResolverFns
 	withIntrospection bool
-	globalEpoch       *uint64
+	globalEpoch       map[uint64]*uint64
 }
 
 // NewServers initializes the GraphQL servers.  It sets up an empty server for the
 // main /graphql endpoint and an admin server.  The result is mainServer, adminServer.
-func NewServers(withIntrospection bool, globalEpoch *uint64, closer *z.Closer) (web.IServeGraphQL,
-	web.IServeGraphQL, *GraphQLHealthStore) {
-	gqlSchema, err := schema.FromString("")
+func NewServers(withIntrospection bool, globalEpoch map[uint64]*uint64,
+	closer *z.Closer) (IServeGraphQL, IServeGraphQL, *GraphQLHealthStore) {
+	gqlSchema, err := schema.FromString("", x.GalaxyNamespace)
 	if err != nil {
 		x.Panic(err)
 	}
 
 	resolvers := resolve.New(gqlSchema, resolverFactoryWithErrorMsg(errNoGraphQLSchema))
-	mainServer := web.NewServer(globalEpoch, resolvers, false)
+	e := globalEpoch[x.GalaxyNamespace]
+	mainServer := NewServer()
+	mainServer.Set(x.GalaxyNamespace, e, resolvers)
 
 	fns := &resolve.ResolverFns{
 		Qrw: resolve.NewQueryRewriter(),
@@ -466,20 +601,22 @@ func NewServers(withIntrospection bool, globalEpoch *uint64, closer *z.Closer) (
 		Ex:  resolve.NewDgraphExecutor(),
 	}
 	adminResolvers := newAdminResolver(mainServer, fns, withIntrospection, globalEpoch, closer)
-	adminServer := web.NewServer(globalEpoch, adminResolvers, true)
+	e = globalEpoch[x.GalaxyNamespace]
+	adminServer := NewServer()
+	adminServer.Set(x.GalaxyNamespace, e, adminResolvers)
 
 	return mainServer, adminServer, mainHealthStore
 }
 
 // newAdminResolver creates a GraphQL request resolver for the /admin endpoint.
 func newAdminResolver(
-	gqlServer web.IServeGraphQL,
+	defaultGqlServer IServeGraphQL,
 	fns *resolve.ResolverFns,
 	withIntrospection bool,
-	epoch *uint64,
+	epoch map[uint64]*uint64,
 	closer *z.Closer) *resolve.RequestResolver {
 
-	adminSchema, err := schema.FromString(graphqlAdminSchema)
+	adminSchema, err := schema.FromString(graphqlAdminSchema, x.GalaxyNamespace)
 	if err != nil {
 		x.Panic(err)
 	}
@@ -489,21 +626,21 @@ func newAdminResolver(
 	server := &adminServer{
 		rf:                rf,
 		resolver:          resolve.New(adminSchema, rf),
-		gqlServer:         gqlServer,
 		fns:               fns,
 		withIntrospection: withIntrospection,
 		globalEpoch:       epoch,
+		schema:            make(map[uint64]*gqlSchema),
+		gqlServer:         defaultGqlServer,
 	}
+	adminServerVar = server // store the admin server in package variable
 
-	prefix := x.DataKey(worker.GqlSchemaPred, 0)
+	prefix := x.DataKey(x.GalaxyAttr(worker.GqlSchemaPred), 0)
 	// Remove uid from the key, to get the correct prefix
 	prefix = prefix[:len(prefix)-8]
 	// Listen for graphql schema changes in group 1.
-	go worker.SubscribeForUpdates([][]byte{prefix}, func(kvs *badgerpb.KVList) {
-		// Last update contains the latest value. So, taking the last update.
-		lastIdx := len(kvs.GetKv()) - 1
-		kv := kvs.GetKv()[lastIdx]
+	go worker.SubscribeForUpdates([][]byte{prefix}, x.IgnoreBytes, func(kvs *badgerpb.KVList) {
 
+		kv := x.KvWithMaxVersion(kvs, [][]byte{prefix})
 		glog.Infof("Updating GraphQL schema from subscription.")
 
 		// Unmarshal the incoming posting list.
@@ -526,22 +663,28 @@ func newAdminResolver(
 			glog.Errorf("Unable to find uid of updated schema %s", err)
 			return
 		}
+		ns, _ := x.ParseNamespaceAttr(pk.Attr)
 
 		newSchema := &gqlSchema{
-			ID:     query.UidToHex(pk.Uid),
-			Schema: string(pl.Postings[0].Value),
+			ID:      query.UidToHex(pk.Uid),
+			Version: kv.GetVersion(),
+			Schema:  string(pl.Postings[0].Value),
 		}
-		server.mux.Lock()
-		if newSchema.Schema == server.schema.Schema {
-			glog.Infof("Skipping GraphQL schema update as the new schema is the same as the current schema.")
-			server.mux.Unlock()
+
+		server.mux.RLock()
+		currentSchema, ok := server.schema[ns]
+		if ok && (newSchema.Version <= currentSchema.Version || newSchema.Schema == currentSchema.Schema) {
+			glog.Infof("Skipping GraphQL schema update, new badger key version is %d, the old version was %d.",
+				newSchema.Version, currentSchema.Version)
+			server.mux.RUnlock()
 			return
 		}
-		server.mux.Unlock()
+		server.mux.RUnlock()
+
 		var gqlSchema schema.Schema
 		// on drop_all, we will receive an empty string as the schema update
 		if newSchema.Schema != "" {
-			gqlSchema, err = generateGQLSchema(newSchema)
+			gqlSchema, err = generateGQLSchema(newSchema, ns)
 			if err != nil {
 				glog.Errorf("Error processing GraphQL schema: %s.  ", err)
 				return
@@ -551,8 +694,20 @@ func newAdminResolver(
 		server.mux.Lock()
 		defer server.mux.Unlock()
 
-		server.schema = newSchema
-		server.resetSchema(gqlSchema)
+		server.incrementSchemaUpdateCounter(ns)
+		// if the schema hasn't been loaded yet, then we don't need to load it here
+		currentSchema, ok = server.schema[ns]
+		if !(ok && currentSchema.loaded) {
+			// this just set schema in admin server, so that next invalid badger subscription update gets rejected upfront
+			server.schema[ns] = newSchema
+			glog.Infof("Skipping in-memory GraphQL schema update, it will be lazy-loaded later.")
+			return
+		}
+
+		// update this schema in both admin and graphql server
+		newSchema.loaded = true
+		server.schema[ns] = newSchema
+		server.resetSchema(ns, gqlSchema)
 
 		glog.Infof("Successfully updated GraphQL schema. Serving New GraphQL API.")
 	}, 1, closer)
@@ -565,13 +720,20 @@ func newAdminResolver(
 func newAdminResolverFactory() resolve.ResolverFactory {
 
 	adminMutationResolvers := map[string]resolve.MutationResolverFunc{
-		"backup":   resolveBackup,
-		"config":   resolveUpdateConfig,
-		"draining": resolveDraining,
-		"export":   resolveExport,
-		"login":    resolveLogin,
-		"restore":  resolveRestore,
-		"shutdown": resolveShutdown,
+		"addNamespace":      resolveAddNamespace,
+		"backup":            resolveBackup,
+		"config":            resolveUpdateConfig,
+		"deleteNamespace":   resolveDeleteNamespace,
+		"draining":          resolveDraining,
+		"export":            resolveExport,
+		"login":             resolveLogin,
+		"resetPassword":     resolveResetPassword,
+		"restore":           resolveRestore,
+		"shutdown":          resolveShutdown,
+		"removeNode":        resolveRemoveNode,
+		"moveTablet":        resolveMoveTablet,
+		"assign":            resolveAssign,
+		"enterpriseLicense": resolveEnterpriseLicense,
 	}
 
 	rf := resolverFactoryWithErrorMsg(errResolverNotFound).
@@ -589,9 +751,6 @@ func newAdminResolverFactory() resolve.ResolverFactory {
 		WithQueryResolver("listBackups", func(q schema.Query) resolve.QueryResolver {
 			return resolve.QueryResolverFunc(resolveListBackups)
 		}).
-		WithQueryResolver("restoreStatus", func(q schema.Query) resolve.QueryResolver {
-			return resolve.QueryResolverFunc(resolveRestoreStatus)
-		}).
 		WithMutationResolver("updateGQLSchema", func(m schema.Mutation) resolve.MutationResolver {
 			return resolve.MutationResolverFunc(
 				func(ctx context.Context, m schema.Mutation) (*resolve.Resolved, bool) {
@@ -599,26 +758,7 @@ func newAdminResolverFactory() resolve.ResolverFactory {
 						false
 				})
 		}).
-		WithMutationResolver("replaceAllowedCORSOrigins", func(m schema.Mutation) resolve.MutationResolver {
-			return resolve.MutationResolverFunc(
-				func(ctx context.Context, m schema.Mutation) (*resolve.Resolved, bool) {
-					return &resolve.Resolved{Err: errors.Errorf(errMsgServerNotReady), Field: m},
-						false
-				})
-		}).
 		WithQueryResolver("getGQLSchema", func(q schema.Query) resolve.QueryResolver {
-			return resolve.QueryResolverFunc(
-				func(ctx context.Context, query schema.Query) *resolve.Resolved {
-					return &resolve.Resolved{Err: errors.Errorf(errMsgServerNotReady), Field: q}
-				})
-		}).
-		WithQueryResolver("getAllowedCORSOrigins", func(q schema.Query) resolve.QueryResolver {
-			return resolve.QueryResolverFunc(
-				func(ctx context.Context, query schema.Query) *resolve.Resolved {
-					return &resolve.Resolved{Err: errors.Errorf(errMsgServerNotReady), Field: q}
-				})
-		}).
-		WithQueryResolver("querySchemaHistory", func(q schema.Query) resolve.QueryResolver {
 			return resolve.QueryResolverFunc(
 				func(ctx context.Context, query schema.Query) *resolve.Resolved {
 					return &resolve.Resolved{Err: errors.Errorf(errMsgServerNotReady), Field: q}
@@ -637,8 +777,8 @@ func newAdminResolverFactory() resolve.ResolverFactory {
 	return rf.WithSchemaIntrospection()
 }
 
-func getCurrentGraphQLSchema() (*gqlSchema, error) {
-	uid, graphQLSchema, err := edgraph.GetGQLSchema()
+func getCurrentGraphQLSchema(namespace uint64) (*gqlSchema, error) {
+	uid, graphQLSchema, err := edgraph.GetGQLSchema(namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -646,16 +786,17 @@ func getCurrentGraphQLSchema() (*gqlSchema, error) {
 	return &gqlSchema{ID: uid, Schema: graphQLSchema}, nil
 }
 
-func generateGQLSchema(sch *gqlSchema) (schema.Schema, error) {
+func generateGQLSchema(sch *gqlSchema, ns uint64) (schema.Schema, error) {
 	schHandler, err := schema.NewHandler(sch.Schema, false)
 	if err != nil {
 		return nil, err
 	}
 	sch.GeneratedSchema = schHandler.GQLSchema()
-	generatedSchema, err := schema.FromString(sch.GeneratedSchema)
+	generatedSchema, err := schema.FromString(sch.GeneratedSchema, ns)
 	if err != nil {
 		return nil, err
 	}
+	generatedSchema.SetMeta(schHandler.MetaInfo())
 
 	return generatedSchema, nil
 }
@@ -678,13 +819,13 @@ func (as *adminServer) initServer() {
 	for {
 		<-time.After(waitFor)
 
-		sch, err := getCurrentGraphQLSchema()
+		sch, err := getCurrentGraphQLSchema(x.GalaxyNamespace)
 		if err != nil {
 			glog.Infof("Error reading GraphQL schema: %s.", err)
 			continue
 		}
-
-		as.schema = sch
+		sch.loaded = true
+		as.schema[x.GalaxyNamespace] = sch
 		// adding the actual resolvers for updateGQLSchema and getGQLSchema only after server has
 		// current GraphQL schema, if there was any.
 		as.addConnectedAdminResolvers()
@@ -695,13 +836,13 @@ func (as *adminServer) initServer() {
 			break
 		}
 
-		generatedSchema, err := generateGQLSchema(sch)
+		generatedSchema, err := generateGQLSchema(sch, x.GalaxyNamespace)
 		if err != nil {
 			glog.Infof("Error processing GraphQL schema: %s.", err)
 			break
 		}
-
-		as.resetSchema(generatedSchema)
+		as.incrementSchemaUpdateCounter(x.GalaxyNamespace)
+		as.resetSchema(x.GalaxyNamespace, generatedSchema)
 
 		glog.Infof("Successfully loaded GraphQL schema.  Serving GraphQL API.")
 
@@ -717,117 +858,56 @@ func (as *adminServer) addConnectedAdminResolvers() {
 
 	as.rf.WithMutationResolver("updateGQLSchema",
 		func(m schema.Mutation) resolve.MutationResolver {
-			return &updateSchemaResolver{
-				admin: as,
-			}
+			return &updateSchemaResolver{admin: as}
 		}).
 		WithQueryResolver("getGQLSchema",
 			func(q schema.Query) resolve.QueryResolver {
-				getResolver := &getSchemaResolver{
-					admin: as,
-				}
-
-				return resolve.NewQueryResolver(
-					getResolver,
-					getResolver,
-					resolve.StdQueryCompletion())
+				return &getSchemaResolver{admin: as}
 			}).
 		WithQueryResolver("queryGroup",
 			func(q schema.Query) resolve.QueryResolver {
-				return resolve.NewQueryResolver(
-					qryRw,
-					dgEx,
-					resolve.StdQueryCompletion())
+				return resolve.NewQueryResolver(qryRw, dgEx)
 			}).
 		WithQueryResolver("queryUser",
 			func(q schema.Query) resolve.QueryResolver {
-				return resolve.NewQueryResolver(
-					qryRw,
-					dgEx,
-					resolve.StdQueryCompletion())
+				return resolve.NewQueryResolver(qryRw, dgEx)
 			}).
 		WithQueryResolver("getGroup",
 			func(q schema.Query) resolve.QueryResolver {
-				return resolve.NewQueryResolver(
-					qryRw,
-					dgEx,
-					resolve.StdQueryCompletion())
+				return resolve.NewQueryResolver(qryRw, dgEx)
 			}).
 		WithQueryResolver("getCurrentUser",
 			func(q schema.Query) resolve.QueryResolver {
-				cuResolver := &currentUserResolver{
-					baseRewriter: qryRw,
-				}
-
-				return resolve.NewQueryResolver(
-					cuResolver,
-					dgEx,
-					resolve.StdQueryCompletion())
+				return resolve.NewQueryResolver(&currentUserResolver{baseRewriter: qryRw}, dgEx)
 			}).
 		WithQueryResolver("getUser",
 			func(q schema.Query) resolve.QueryResolver {
-				return resolve.NewQueryResolver(
-					qryRw,
-					dgEx,
-					resolve.StdQueryCompletion())
+				return resolve.NewQueryResolver(qryRw, dgEx)
 			}).
-		WithQueryResolver("getAllowedCORSOrigins", func(q schema.Query) resolve.QueryResolver {
-			return resolve.QueryResolverFunc(resolveGetCors)
-		}).
-		WithQueryResolver("querySchemaHistory", func(q schema.Query) resolve.QueryResolver {
-			// Add the desceding order to the created_at to get the schema history in
-			// descending order.
-			q.Arguments()["order"] = map[string]interface{}{"desc": "created_at"}
-			return resolve.NewQueryResolver(
-				qryRw,
-				dgEx,
-				resolve.StdQueryCompletion())
-		}).
 		WithMutationResolver("addUser",
 			func(m schema.Mutation) resolve.MutationResolver {
-				return resolve.NewDgraphResolver(
-					resolve.NewAddRewriter(),
-					dgEx,
-					resolve.StdMutationCompletion(m.Name()))
+				return resolve.NewDgraphResolver(resolve.NewAddRewriter(), dgEx)
 			}).
 		WithMutationResolver("addGroup",
 			func(m schema.Mutation) resolve.MutationResolver {
-				return resolve.NewDgraphResolver(
-					NewAddGroupRewriter(),
-					dgEx,
-					resolve.StdMutationCompletion(m.Name()))
+				return resolve.NewDgraphResolver(NewAddGroupRewriter(), dgEx)
 			}).
 		WithMutationResolver("updateUser",
 			func(m schema.Mutation) resolve.MutationResolver {
-				return resolve.NewDgraphResolver(
-					resolve.NewUpdateRewriter(),
-					dgEx,
-					resolve.StdMutationCompletion(m.Name()))
+				return resolve.NewDgraphResolver(resolve.NewUpdateRewriter(), dgEx)
 			}).
 		WithMutationResolver("updateGroup",
 			func(m schema.Mutation) resolve.MutationResolver {
-				return resolve.NewDgraphResolver(
-					NewUpdateGroupRewriter(),
-					dgEx,
-					resolve.StdMutationCompletion(m.Name()))
+				return resolve.NewDgraphResolver(NewUpdateGroupRewriter(), dgEx)
 			}).
 		WithMutationResolver("deleteUser",
 			func(m schema.Mutation) resolve.MutationResolver {
-				return resolve.NewDgraphResolver(
-					resolve.NewDeleteRewriter(),
-					dgEx,
-					resolve.StdDeleteCompletion(m.Name()))
+				return resolve.NewDgraphResolver(resolve.NewDeleteRewriter(), dgEx)
 			}).
 		WithMutationResolver("deleteGroup",
 			func(m schema.Mutation) resolve.MutationResolver {
-				return resolve.NewDgraphResolver(
-					resolve.NewDeleteRewriter(),
-					dgEx,
-					resolve.StdDeleteCompletion(m.Name()))
-			}).
-		WithMutationResolver("replaceAllowedCORSOrigins", func(m schema.Mutation) resolve.MutationResolver {
-			return resolve.MutationResolverFunc(resolveReplaceAllowedCORSOrigins)
-		})
+				return resolve.NewDgraphResolver(resolve.NewDeleteRewriter(), dgEx)
+			})
 }
 
 func resolverFactoryWithErrorMsg(msg string) resolve.ResolverFactory {
@@ -845,31 +925,113 @@ func resolverFactoryWithErrorMsg(msg string) resolve.ResolverFactory {
 	return resolve.NewResolverFactory(qErr, mErr)
 }
 
-func (as *adminServer) resetSchema(gqlSchema schema.Schema) {
+func (as *adminServer) getGlobalEpoch(ns uint64) *uint64 {
+	e := as.globalEpoch[ns]
+	if e == nil {
+		e = new(uint64)
+		as.globalEpoch[ns] = e
+	}
+	return e
+}
+
+func (as *adminServer) incrementSchemaUpdateCounter(ns uint64) {
+	// Increment the Epoch when you get a new schema. So, that subscription's local epoch
+	// will match against global epoch to terminate the current subscriptions.
+	atomic.AddUint64(as.getGlobalEpoch(ns), 1)
+}
+
+func (as *adminServer) resetSchema(ns uint64, gqlSchema schema.Schema) {
 	// set status as updating schema
 	mainHealthStore.updatingSchema()
 
 	var resolverFactory resolve.ResolverFactory
-	// If schema is nil (which becomes after drop_all) then do not attach Resolver for
+	// gqlSchema can be nil in following cases:
+	// * after DROP_ALL
+	// * if the schema hasn't yet been set even once for a non-Galaxy namespace
+	// If schema is nil then do not attach Resolver for
 	// introspection operations, and set GQL schema to empty.
 	if gqlSchema == nil {
 		resolverFactory = resolverFactoryWithErrorMsg(errNoGraphQLSchema)
-		gqlSchema, _ = schema.FromString("")
+		gqlSchema, _ = schema.FromString("", ns)
 	} else {
 		resolverFactory = resolverFactoryWithErrorMsg(errResolverNotFound).
 			WithConventionResolvers(gqlSchema, as.fns)
+		// If the schema is a Federated Schema then attach "_service" resolver
+		if gqlSchema.IsFederated() {
+			resolverFactory.WithQueryResolver("_service", func(s schema.Query) resolve.QueryResolver {
+				return resolve.QueryResolverFunc(func(ctx context.Context, query schema.Query) *resolve.Resolved {
+					as.mux.RLock()
+					defer as.mux.RUnlock()
+					sch := as.schema[ns].Schema
+					handler, err := schema.NewHandler(sch, true)
+					if err != nil {
+						return resolve.EmptyResult(query, err)
+					}
+					data := handler.GQLSchemaWithoutApolloExtras()
+					return resolve.DataResult(query,
+						map[string]interface{}{"_service": map[string]interface{}{"sdl": data}},
+						nil)
+				})
+			})
+		}
+
 		if as.withIntrospection {
 			resolverFactory.WithSchemaIntrospection()
 		}
 	}
 
-	// Increment the Epoch when you get a new schema. So, that subscription's local epoch
-	// will match against global epoch to terminate the current subscriptions.
-	atomic.AddUint64(as.globalEpoch, 1)
-	as.gqlServer.ServeGQL(resolve.New(gqlSchema, resolverFactory))
+	resolvers := resolve.New(gqlSchema, resolverFactory)
+	as.gqlServer.Set(ns, as.getGlobalEpoch(ns), resolvers)
 
 	// reset status to up, as now we are serving the new schema
 	mainHealthStore.up()
+}
+
+func (as *adminServer) lazyLoadSchema(namespace uint64) {
+	// if the schema is already in memory, no need to fetch it from disk
+	as.mux.RLock()
+	if currentSchema, ok := as.schema[namespace]; ok && currentSchema.loaded {
+		as.mux.RUnlock()
+		return
+	}
+	as.mux.RUnlock()
+
+	// otherwise, fetch the schema from disk
+	sch, err := getCurrentGraphQLSchema(namespace)
+	if err != nil {
+		glog.Infof("Error reading GraphQL schema: %s.", err)
+		return
+	}
+
+	var generatedSchema schema.Schema
+	if sch.Schema == "" {
+		// if there was no schema stored in Dgraph, we still need to attach resolvers to the main
+		// graphql server which should just return errors for any incoming request.
+		// generatedSchema will be nil in this case
+		glog.Infof("No GraphQL schema in Dgraph; serving empty GraphQL API")
+	} else {
+		generatedSchema, err = generateGQLSchema(sch, namespace)
+		if err != nil {
+			glog.Infof("Error processing GraphQL schema: %s.", err)
+			return
+		}
+	}
+
+	as.mux.Lock()
+	defer as.mux.Unlock()
+	sch.loaded = true
+	as.schema[namespace] = sch
+	as.resetSchema(namespace, generatedSchema)
+
+	glog.Infof("Successfully lazy-loaded GraphQL schema.")
+}
+
+func LazyLoadSchema(namespace uint64) {
+	adminServerVar.lazyLoadSchema(namespace)
+}
+
+func inputArgError(err error) error {
+	return schema.GQLWrapf(err, "couldn't parse input argument")
 }
 
 func response(code, msg string) map[string]interface{} {

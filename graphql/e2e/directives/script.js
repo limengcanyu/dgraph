@@ -2,6 +2,8 @@ const authorBio = ({parent: {name, dob}}) => `My name is ${name} and I was born 
 const characterBio = ({parent: {name}}) => `My name is ${name}.`
 const humanBio = ({parent: {name, totalCredits}}) => `My name is ${name}. I have ${totalCredits} credits.`
 const droidBio = ({parent: {name, primaryFunction}}) => `My name is ${name}. My primary function is ${primaryFunction}.`
+const summary = () => `hi`
+const astronautBio = ({parent: {name, age, isActive}}) => `Name - ${name}, Age - ${age}, isActive - ${isActive}`
 
 async function authorsByName({args, dql}) {
     const results = await dql.query(`query queryAuthor($name: string) {
@@ -32,6 +34,8 @@ self.addGraphQLResolvers({
     "Character.bio": characterBio,
     "Human.bio": humanBio,
     "Droid.bio": droidBio,
+    "Book.summary": summary,
+    "Astronaut.bio": astronautBio,
     "Query.authorsByName": authorsByName,
     "Mutation.newAuthor": newAuthor
 })
@@ -49,3 +53,19 @@ async function rank({parents}) {
 self.addMultiParentGraphQLResolvers({
     "Author.rank": rank
 })
+
+async function districtWebhook({ dql, graphql, authHeader, event }) {
+    // forward the event to the changelog server running on the host machine
+    await fetch(`http://172.17.0.1:8888/changelog`, {
+        method: "POST",
+        body: JSON.stringify(event)
+    })
+    // just return, nothing else to do with response
+}
+
+self.addWebHookResolvers({
+    "District.add": districtWebhook,
+    "District.update": districtWebhook,
+    "District.delete": districtWebhook,
+})
+

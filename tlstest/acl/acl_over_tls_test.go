@@ -9,18 +9,22 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dgraph-io/dgraph/testutil"
+	"github.com/dgraph-io/dgraph/x"
 	"github.com/spf13/viper"
 )
 
 func TestLoginOverTLS(t *testing.T) {
 	conf := viper.New()
-	conf.Set("tls-cacert", "../tls/ca.crt")
-	conf.Set("tls-server-name", "node")
+	conf.Set("tls", fmt.Sprintf("ca-cert=%s; server-name=%s;",
+		// ca-cert
+		"../mtls_internal/tls/live/ca.crt",
+		// server-name
+		"alpha1"))
 
 	dg, err := testutil.DgraphClientWithCerts(testutil.SockAddr, conf)
 	require.NoError(t, err)
 	for i := 0; i < 30; i++ {
-		err = dg.Login(context.Background(), "groot", "password")
+		err = dg.LoginIntoNamespace(context.Background(), "groot", "password", x.GalaxyNamespace)
 		if err == nil {
 			return
 		}

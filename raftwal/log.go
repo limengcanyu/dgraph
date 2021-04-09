@@ -22,15 +22,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/pb"
-	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/y"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/golang/glog"
@@ -53,7 +53,7 @@ const (
 	// and baseIV (remaining 8 bytes) are stored.
 	encOffset = logFileOffset - 16 // 1MB - 16B
 	// logFileSize is the initial size of the log file.
-	logFileSize = 64 << 20 // 64MB
+	logFileSize = 256 << 20 // 256MB
 	// entrySize is the size in bytes of a single entry.
 	entrySize = 32
 	// logSuffix is the suffix for log files.
@@ -61,7 +61,8 @@ const (
 )
 
 var (
-	emptyEntry = entry(make([]byte, entrySize))
+	emptyEntry    = entry(make([]byte, entrySize))
+	encryptionKey x.Sensitive
 )
 
 type entry []byte
@@ -91,7 +92,7 @@ type logFile struct {
 }
 
 func logFname(dir string, id int64) string {
-	return path.Join(dir, fmt.Sprintf("%05d%s", id, logSuffix))
+	return filepath.Join(dir, fmt.Sprintf("%05d%s", id, logSuffix))
 }
 
 // openLogFile opens a logFile in the given directory. The filename is
@@ -103,15 +104,14 @@ func openLogFile(dir string, fid int64) (*logFile, error) {
 		fid: fid,
 	}
 	var err error
-	encKey := x.WorkerConfig.EncryptionKey
 	// Initialize the registry for logFile if encryption in enabled.
 	// NOTE: If encryption is enabled then there is no going back because if we disable it
 	// later then the older log files which were previously encrypted can't be opened.
-	if len(encKey) > 0 {
+	if len(encryptionKey) > 0 {
 		krOpt := badger.KeyRegistryOptions{
 			ReadOnly:                      false,
 			Dir:                           dir,
-			EncryptionKey:                 encKey,
+			EncryptionKey:                 encryptionKey,
 			EncryptionKeyRotationDuration: 10 * 24 * time.Hour,
 			InMemory:                      false,
 		}
@@ -138,14 +138,14 @@ func openLogFile(dir string, fid int64) (*logFile, error) {
 		// If keyID is non-zero, then the opened file is encrypted.
 		if keyID != 0 {
 			// Logfile is encrypted but encryption key is not provided.
-			if encKey == nil {
+			if encryptionKey == nil {
 				return nil, errors.New("Logfile is encrypted but encryption key is nil")
 			}
 			// retrieve datakey from the keyID of the logfile.
 			if lf.dataKey, err = lf.registry.DataKey(keyID); err != nil {
 				return nil, err
 			}
-			lf.baseIV = buf[8:]
+			lf.baseIV = y.Copy(buf[8:])
 			y.AssertTrue(len(lf.baseIV) == 8)
 		}
 	}
@@ -275,7 +275,7 @@ func getLogFiles(dir string) ([]*logFile, error) {
 	seen := make(map[int64]struct{})
 
 	for _, fpath := range entryFiles {
-		_, fname := path.Split(fpath)
+		_, fname := filepath.Split(fpath)
 		fname = strings.TrimSuffix(fname, logSuffix)
 
 		fid, err := strconv.ParseInt(fname, 10, 64)
@@ -346,6 +346,7 @@ func (lf *logFile) bootstrap() error {
 		return y.Wrapf(err, "Error while creating base IV, while creating logfile")
 	}
 	// Initialize base IV.
-	lf.baseIV = buf[8:]
+	lf.baseIV = y.Copy(buf[8:])
+	y.AssertTrue(len(lf.baseIV) == 8)
 	return nil
 }

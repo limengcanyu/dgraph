@@ -19,7 +19,6 @@ package bulk
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -35,17 +34,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgraph-io/badger/v2"
-	bo "github.com/dgraph-io/badger/v2/options"
-	bpb "github.com/dgraph-io/badger/v2/pb"
-	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/badger/v3"
+	bo "github.com/dgraph-io/badger/v3/options"
+	bpb "github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/y"
 	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
-	"github.com/dgraph-io/dgraph/worker"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/ristretto/z"
+	"github.com/dgraph-io/roaring/roaring64"
 	"github.com/dustin/go-humanize"
+	"github.com/golang/snappy"
 )
 
 type reducer struct {
@@ -126,18 +126,6 @@ func (r *reducer) run() error {
 }
 
 func (r *reducer) createBadgerInternal(dir string, compression bool) *badger.DB {
-	if r.opt.EncryptionKey != nil {
-		// Need to set zero addr in WorkerConfig before checking the license.
-		x.WorkerConfig.ZeroAddr = []string{r.opt.ZeroAddr}
-
-		if !worker.EnterpriseEnabled() {
-			// Crash since the enterprise license is not enabled..
-			log.Fatal("Enterprise License needed for the Encryption feature.")
-		} else {
-			log.Printf("Encryption feature enabled.")
-		}
-	}
-
 	key := r.opt.EncryptionKey
 	if !r.opt.EncryptedOut {
 		key = nil
@@ -145,7 +133,6 @@ func (r *reducer) createBadgerInternal(dir string, compression bool) *badger.DB 
 
 	opt := badger.DefaultOptions(dir).
 		WithSyncWrites(false).
-		WithValueThreshold(1 << 20 /* 1 KB */).
 		WithEncryptionKey(key).
 		WithBlockCacheSize(r.opt.BlockCacheSize).
 		WithIndexCacheSize(r.opt.IndexCacheSize)
@@ -236,11 +223,10 @@ func (mi *mapIterator) Close() error {
 func newMapIterator(filename string) (*pb.MapHeader, *mapIterator) {
 	fd, err := os.Open(filename)
 	x.Check(err)
-	gzReader, err := gzip.NewReader(fd)
-	x.Check(err)
+	r := snappy.NewReader(fd)
 
 	// Read the header size.
-	reader := bufio.NewReaderSize(gzReader, 16<<10)
+	reader := bufio.NewReaderSize(r, 16<<10)
 	headerLenBuf := make([]byte, 4)
 	x.Check2(io.ReadFull(reader, headerLenBuf))
 	headerLen := binary.BigEndian.Uint32(headerLenBuf)
@@ -263,7 +249,7 @@ type encodeRequest struct {
 	cbuf     *z.Buffer
 	countBuf *z.Buffer
 	wg       *sync.WaitGroup
-	listCh   chan *bpb.KVList
+	listCh   chan *z.Buffer
 	splitCh  chan *bpb.KVList
 }
 
@@ -305,7 +291,7 @@ func (r *reducer) writeTmpSplits(ci *countIndexer, wg *sync.WaitGroup) {
 		}
 
 		for i := 0; i < len(kvs.Kv); i += maxSplitBatchLen {
-			// Flush the write batch when the max batch length is reached to prevent the
+			// flush the write batch when the max batch length is reached to prevent the
 			// value log from growing over the allowed limit.
 			if splitBatchLen >= maxSplitBatchLen {
 				x.Check(ci.splitWriter.Flush())
@@ -320,7 +306,7 @@ func (r *reducer) writeTmpSplits(ci *countIndexer, wg *sync.WaitGroup) {
 				batch.Kv = kvs.Kv[i : i+maxSplitBatchLen]
 			}
 			splitBatchLen += len(batch.Kv)
-			x.Check(ci.splitWriter.Write(batch))
+			x.Check(ci.splitWriter.WriteList(batch))
 		}
 	}
 	x.Check(ci.splitWriter.Flush())
@@ -353,24 +339,35 @@ func (r *reducer) startWriting(ci *countIndexer, writerCh chan *encodeRequest, c
 
 	var lastStreamId uint32
 	write := func(req *encodeRequest) {
-		for kvlist := range req.listCh {
-			x.Check(ci.writer.Write(kvlist))
+		for kvBuf := range req.listCh {
+			x.Check(ci.writer.Write(kvBuf))
 
-			for _, kv := range kvlist.GetKv() {
+			kv := &bpb.KV{}
+			err := kvBuf.SliceIterate(func(s []byte) error {
+				kv.Reset()
+				x.Check(kv.Unmarshal(s))
 				if lastStreamId == kv.StreamId {
-					continue
+					return nil
 				}
 				if lastStreamId > 0 {
 					fmt.Printf("Finishing stream id: %d\n", lastStreamId)
-					list := &bpb.KVList{}
-					list.Kv = append(list.Kv, &bpb.KV{
+					doneKV := &bpb.KV{
 						StreamId:   lastStreamId,
 						StreamDone: true,
-					})
-					ci.writer.Write(list)
+					}
+
+					buf := z.NewBuffer(512, "Reducer.Write")
+					defer buf.Release()
+					badger.KVToBuffer(doneKV, buf)
+
+					ci.writer.Write(buf)
 				}
 				lastStreamId = kv.StreamId
-			}
+				return nil
+
+			})
+			x.Check(err)
+			kvBuf.Release()
 		}
 	}
 
@@ -391,11 +388,16 @@ func (r *reducer) writeSplitLists(db, tmpDb *badger.DB, writer *badger.StreamWri
 	baseStreamId := atomic.AddUint32(&r.streamId, 1)
 	stream := tmpDb.NewStreamAt(math.MaxUint64)
 	stream.LogPrefix = "copying split keys to main DB"
-	stream.Send = func(kvs *bpb.KVList) error {
+	stream.Send = func(buf *z.Buffer) error {
+		kvs, err := badger.BufferToKVList(buf)
+		x.Check(err)
+
+		buf.Reset()
 		for _, kv := range kvs.Kv {
 			kv.StreamId += baseStreamId
+			badger.KVToBuffer(kv, buf)
 		}
-		x.Check(writer.Write(kvs))
+		x.Check(writer.Write(buf))
 		return nil
 	}
 	x.Check(stream.Orchestrate(context.Background()))
@@ -434,7 +436,8 @@ func bufferStats(cbuf *z.Buffer) {
 }
 
 func getBuf(dir string) *z.Buffer {
-	cbuf, err := z.NewBufferWithDir(64<<20, 64<<30, z.UseCalloc, filepath.Join(dir, bufferDir))
+	cbuf, err := z.NewBufferWithDir(64<<20, 64<<30, z.UseCalloc,
+		filepath.Join(dir, bufferDir), "Reducer.GetBuf")
 	x.Check(err)
 	cbuf.AutoMmapAfter(1 << 30)
 	return cbuf
@@ -461,7 +464,7 @@ func (r *reducer) reduce(partitionKeys [][]byte, mapItrs []*mapIterator, ci *cou
 		req := &encodeRequest{
 			cbuf:     zbuf,
 			wg:       wg,
-			listCh:   make(chan *bpb.KVList, 3),
+			listCh:   make(chan *z.Buffer, 3),
 			splitCh:  ci.splitCh,
 			countBuf: getBuf(r.opt.TmpDir),
 		}
@@ -482,8 +485,8 @@ func (r *reducer) reduce(partitionKeys [][]byte, mapItrs []*mapIterator, ci *cou
 		partitionKeys = append(partitionKeys, nil)
 
 		for i := 0; i < len(partitionKeys); i++ {
+			pkey := partitionKeys[i]
 			for _, itr := range mapItrs {
-				pkey := partitionKeys[i]
 				itr.Next(cbuf, pkey)
 			}
 			if cbuf.LenNoPadding() < 256<<20 {
@@ -547,7 +550,7 @@ func (r *reducer) toList(req *encodeRequest) {
 	pl := new(pb.PostingList)
 	writeVersionTs := r.state.writeTs
 
-	kvList := &bpb.KVList{}
+	kvBuf := z.NewBuffer(260<<20, "Reducer.Buffer.ToList")
 	trackCountIndex := make(map[string]bool)
 
 	var freePostings []*pb.Posting
@@ -592,10 +595,10 @@ func (r *reducer) toList(req *encodeRequest) {
 			}
 		}
 
-		enc := codec.Encoder{BlockSize: 256}
+		bm := roaring64.New()
 		var lastUid uint64
 		slice, next := []byte{}, start
-		for next != 0 && (next < end || end == 0) {
+		for next >= 0 && (next < end || end == -1) {
 			slice, next = cbuf.Slice(next)
 			me := MapEntry(slice)
 
@@ -605,7 +608,7 @@ func (r *reducer) toList(req *encodeRequest) {
 			}
 			lastUid = uid
 
-			enc.Add(uid)
+			bm.Add(uid)
 			if pbuf := me.Plist(); len(pbuf) > 0 {
 				p := getPosting()
 				x.Check(p.Unmarshal(pbuf))
@@ -615,8 +618,8 @@ func (r *reducer) toList(req *encodeRequest) {
 
 		// We should not do defer FreePack here, because we might be giving ownership of it away if
 		// we run Rollup.
-		pl.Pack = enc.Done()
-		numUids := codec.ExactLen(pl.Pack)
+		pl.Bitmap = codec.ToBytes(bm)
+		numUids := bm.GetCardinality()
 
 		atomic.AddInt64(&r.prog.reduceKeyCount, 1)
 
@@ -626,7 +629,7 @@ func (r *reducer) toList(req *encodeRequest) {
 		// the full pb.Posting type is used (which pb.y contains the
 		// delta packed UID list).
 		if numUids == 0 {
-			codec.FreePack(pl.Pack)
+			// No need to FrePack here because we are reusing alloc.
 			return
 		}
 
@@ -647,7 +650,8 @@ func (r *reducer) toList(req *encodeRequest) {
 			}
 		}
 
-		shouldSplit := pl.Size() > (1<<20)/2 && len(pl.Pack.Blocks) > 1
+		shouldSplit, err := posting.ShouldSplit(pl)
+		x.Check(err)
 		if shouldSplit {
 			// Give ownership of pl.Pack away to list. Rollup would deallocate the Pack.
 			l := posting.NewList(y.Copy(currentKey), pl, writeVersionTs)
@@ -657,18 +661,18 @@ func (r *reducer) toList(req *encodeRequest) {
 			for _, kv := range kvs {
 				kv.StreamId = r.streamIdFor(pk.Attr)
 			}
-			kvList.Kv = append(kvList.Kv, kvs[0])
+			badger.KVToBuffer(kvs[0], kvBuf)
 			if splits := kvs[1:]; len(splits) > 0 {
 				req.splitCh <- &bpb.KVList{Kv: splits}
 			}
 		} else {
 			kv := posting.MarshalPostingList(pl, nil)
-			codec.FreePack(pl.Pack)
+			// No need to FreePack here, because we are reusing alloc.
 
 			kv.Key = y.Copy(currentKey)
 			kv.Version = writeVersionTs
 			kv.StreamId = r.streamIdFor(pk.Attr)
-			kvList.Kv = append(kvList.Kv, kv)
+			badger.KVToBuffer(kv, kvBuf)
 		}
 
 		for _, p := range pl.Postings {
@@ -677,8 +681,7 @@ func (r *reducer) toList(req *encodeRequest) {
 		pl.Reset()
 	}
 
-	var sz int
-	for end != 0 {
+	for end >= 0 {
 		slice, next := cbuf.Slice(end)
 		entry := MapEntry(slice)
 		entryKey := entry.Key()
@@ -687,11 +690,9 @@ func (r *reducer) toList(req *encodeRequest) {
 			appendToList()
 			start, num = end, 0 // Start would start from current one.
 
-			sz += kvList.Kv[len(kvList.Kv)-1].Size()
-			if sz > 256<<20 {
-				req.listCh <- kvList
-				kvList = &bpb.KVList{}
-				sz = 0
+			if kvBuf.LenNoPadding() > 256<<20 {
+				req.listCh <- kvBuf
+				kvBuf = z.NewBuffer(260<<20, "Reducer.Buffer.KVBuffer")
 			}
 		}
 		end = next
@@ -700,8 +701,10 @@ func (r *reducer) toList(req *encodeRequest) {
 	}
 
 	appendToList()
-	if len(kvList.Kv) > 0 {
-		req.listCh <- kvList
+	if kvBuf.LenNoPadding() > 0 {
+		req.listCh <- kvBuf
+	} else {
+		kvBuf.Release()
 	}
 	close(req.listCh)
 

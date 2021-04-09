@@ -21,6 +21,7 @@ type State {
         xcode: String! @id @search(by: [regexp])
         name: String!
         capital: String
+        region: Region
 	    country: Country @dgraph(pred: "inCountry")
 }
 
@@ -105,11 +106,20 @@ interface Character @dgraph(type: "performance.character") {
 }
 
 type Human implements Character & Employee {
+        id: ID!
+        name: String! @search(by: [exact])
+        appearsIn: [Episode!] @search
+        bio: String @lambda
+        ename: String!
         starships: [Starship]
         totalCredits: Float @dgraph(pred: "credits")
 }
 
 type Droid implements Character @dgraph(type: "roboDroid") {
+        id: ID!
+        name: String! @search(by: [exact])
+        appearsIn: [Episode!] @search
+        bio: String @lambda
         primaryFunction: String
 }
 
@@ -191,12 +201,25 @@ type post1{
     numLikes: Int64 @search
     commentsByMonth: [Int]
     likesByMonth: [Int64]
+    author: author1 @hasInverse(field: posts)
 }
 
 type Person1 {
     id: ID!
     name: String!
     friends: [Person1] @hasInverse(field: friends)
+}
+
+type Person {
+    id: ID!
+    name: String! @search(by: [hash])
+    nameHi: String @dgraph(pred:"Person.name@hi") @search(by: [hash])
+    nameZh: String @dgraph(pred:"Person.name@zh") @search(by: [hash])
+    nameHiZh: String @dgraph(pred:"Person.name@hi:zh")
+    nameZhHi: String @dgraph(pred:"Person.name@zh:hi")
+    nameHi_Zh_Untag: String @dgraph(pred:"Person.name@hi:zh:.")
+    name_Untag_AnyLang: String @dgraph(pred:"Person.name@.") @search(by: [hash])
+    professionEn: String @dgraph(pred:"Person.profession@en")
 }
 
 # union testing - start
@@ -273,4 +296,95 @@ type University @generate(
     id: ID!
     name: String!
     numStudents: Int
+}
+
+# @id directive with multiple data types
+type Book {
+    bookId: Int64! @id
+    name: String!
+    desc: String
+	summary: String @lambda
+	chapters: [Chapter] @hasInverse(field: book)
+}
+
+type Chapter {
+    chapterId: Int! @id
+    name: String!
+	book: Book
+}
+
+type Mission @key(fields: "id") {
+    id: String! @id
+    crew: [Astronaut] @provides(fields: "name") @hasInverse(field: missions)
+    spaceShip: [SpaceShip]
+    designation: String!
+    startDate: String
+    endDate: String
+}
+
+type Astronaut @key(fields: "id") @extends {
+    id: ID! @external
+    name: String @external
+    age: Int @external
+    isActive: Boolean
+    bio: String @requires(fields: "name age") @lambda
+    missions: [Mission]
+}
+
+type SpaceShip @key(fields: "id") @extends {
+    id: String! @id @external
+    missions: [Mission]
+}
+
+type Planet @key(fields: "id") @extends {
+        id: Int! @id @external
+        missions: [Mission]
+}
+
+type Region {
+    id: String! @id
+    name: String!
+    district: District
+}
+
+type District @lambdaOnMutate(add: true, update: true, delete: true) {
+    dgId: ID!
+    id: String! @id
+    name: String!
+}
+
+type Owner {
+    username: String! @id
+    password: String!
+    projects: [Project!] @hasInverse(field: owner)
+}
+
+type Project {
+    id: String! @id
+    owner: Owner!
+    name: String! @search(by: [hash])
+    datasets: [Dataset!] @hasInverse(field: project)
+}
+
+type Dataset {
+    id: String! @id
+    owner: Owner!
+    project: Project!
+    name: String! @search(by: [hash])
+}
+
+type author1{
+    name:String! @id @search(by: [regexp])
+    posts:[post1] @hasInverse(field: author)
+}
+# multiple fields with @id directive
+type Worker {
+    name: String!
+    reg_No: Int! @id
+    emp_Id: String! @id
+}
+
+type Employer {
+    company: String! @id
+    worker: [Worker]
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2021 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package bulk
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
@@ -28,6 +29,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/dgraph-io/dgraph/ee"
+	"github.com/dgraph-io/dgraph/filestore"
+	"github.com/dgraph-io/dgraph/protos/pb"
+	"github.com/dgraph-io/dgraph/worker"
+	"github.com/dgraph-io/ristretto/z"
 
 	"github.com/dgraph-io/dgraph/ee/enc"
 	"github.com/dgraph-io/dgraph/tok"
@@ -40,15 +47,20 @@ var Bulk x.SubCommand
 
 var defaultOutDir = "./out"
 
+const BulkBadgerDefaults = "compression=snappy; goroutines=8;" +
+	" cache_mb=64; cache_percentage=70,30;"
+
 func init() {
 	Bulk.Cmd = &cobra.Command{
 		Use:   "bulk",
-		Short: "Run Dgraph bulk loader",
+		Short: "Run Dgraph Bulk Loader",
 		Run: func(cmd *cobra.Command, args []string) {
 			defer x.StartProfile(Bulk.Conf).Stop()
 			run()
 		},
+		Annotations: map[string]string{"group": "data-load"},
 	}
+	Bulk.Cmd.SetHelpTemplate(x.NonRootTemplate)
 	Bulk.EnvPrefix = "DGRAPH_BULK"
 
 	flag := Bulk.Cmd.Flags()
@@ -56,99 +68,111 @@ func init() {
 		"Location of *.rdf(.gz) or *.json(.gz) file(s) to load.")
 	flag.StringP("schema", "s", "",
 		"Location of schema file.")
-	flag.StringP("graphql-schema", "g", "", "Location of the GraphQL schema file.")
+	flag.StringP("graphql_schema", "g", "", "Location of the GraphQL schema file.")
 	flag.String("format", "",
 		"Specify file format (rdf or json) instead of getting it from filename.")
 	flag.Bool("encrypted", false,
 		"Flag to indicate whether schema and data files are encrypted. "+
-			"Must be specified with --encryption-key-file or vault option(s).")
-	flag.Bool("encrypted-out", false,
+			"Must be specified with --encryption_key_file or vault option(s).")
+	flag.Bool("encrypted_out", false,
 		"Flag to indicate whether to encrypt the output. "+
-			"Must be specified with --encryption-key-file or vault option(s).")
+			"Must be specified with --encryption_key_file or vault option(s).")
 	flag.String("out", defaultOutDir,
 		"Location to write the final dgraph data directories.")
-	flag.Bool("replace-out", false,
+	flag.Bool("replace_out", false,
 		"Replace out directory and its contents if it exists.")
 	flag.String("tmp", "tmp",
 		"Temp directory used to use for on-disk scratch space. Requires free space proportional"+
 			" to the size of the RDF file and the amount of indexing used.")
 
-	flag.IntP("num-go-routines", "j", int(math.Ceil(float64(runtime.NumCPU())/4.0)),
+	flag.IntP("num_go_routines", "j", int(math.Ceil(float64(runtime.NumCPU())/4.0)),
 		"Number of worker threads to use. MORE THREADS LEAD TO HIGHER RAM USAGE.")
-	flag.Int64("mapoutput-mb", 2048,
+	flag.Int64("mapoutput_mb", 2048,
 		"The estimated size of each map file output. Increasing this increases memory usage.")
-	flag.Int64("partition-mb", 4, "Pick a partition key every N megabytes of data.")
-	flag.Bool("skip-map-phase", false,
+	flag.Int64("partition_mb", 4, "Pick a partition key every N megabytes of data.")
+	flag.Bool("skip_map_phase", false,
 		"Skip the map phase (assumes that map output files already exist).")
-	flag.Bool("cleanup-tmp", true,
+	flag.Bool("cleanup_tmp", true,
 		"Clean up the tmp directory after the loader finishes. Setting this to false allows the"+
 			" bulk loader can be re-run while skipping the map phase.")
 	flag.Int("reducers", 1,
 		"Number of reducers to run concurrently. Increasing this can improve performance, and "+
 			"must be less than or equal to the number of reduce shards.")
 	flag.Bool("version", false, "Prints the version of Dgraph Bulk Loader.")
-	flag.Bool("store-xids", false, "Generate an xid edge for each node.")
+	flag.Bool("store_xids", false, "Generate an xid edge for each node.")
 	flag.StringP("zero", "z", "localhost:5080", "gRPC address for Dgraph zero")
 	flag.String("xidmap", "", "Directory to store xid to uid mapping")
 	// TODO: Potentially move http server to main.
 	flag.String("http", "localhost:8080",
 		"Address to serve http (pprof).")
-	flag.Bool("ignore-errors", false, "ignore line parsing errors in rdf files")
-	flag.Int("map-shards", 1,
+	flag.Bool("ignore_errors", false, "ignore line parsing errors in rdf files")
+	flag.Int("map_shards", 1,
 		"Number of map output shards. Must be greater than or equal to the number of reduce "+
 			"shards. Increasing allows more evenly sized reduce shards, at the expense of "+
 			"increased memory usage.")
-	flag.Int("reduce-shards", 1,
+	flag.Int("reduce_shards", 1,
 		"Number of reduce shards. This determines the number of dgraph instances in the final "+
 			"cluster. Increasing this potentially decreases the reduce stage runtime by using "+
 			"more parallelism, but increases memory usage.")
-	flag.String("custom-tokenizers", "",
+	flag.String("custom_tokenizers", "",
 		"Comma separated list of tokenizer plugins")
-	flag.Bool("new-uids", false,
+	flag.Bool("new_uids", false,
 		"Ignore UIDs in load files and assign new ones.")
+	flag.Uint64("force-namespace", math.MaxUint64,
+		"Namespace onto which to load the data. If not set, will preserve the namespace.")
 
-	// Options around how to set up Badger.
-	flag.String("badger.compression", "snappy",
-		"[none, zstd:level, snappy] Specifies the compression algorithm and the compression"+
-			"level (if applicable) for the postings directory. none would disable compression,"+
-			" while zstd:1 would set zstd compression at level 1.")
-	flag.Int64("badger.cache-mb", 64, "Total size of cache (in MB) per shard in reducer.")
-	flag.String("badger.cache-percentage", "70,30",
-		"Cache percentages summing up to 100 for various caches"+
-			" (FORMAT: BlockCacheSize, IndexCacheSize).")
+	flag.String("badger", BulkBadgerDefaults, z.NewSuperFlagHelp(BulkBadgerDefaults).
+		Head("Badger options").
+		Flag("compression",
+			"Specifies the compression algorithm and compression level (if applicable) for the "+
+				`postings directory. "none" would disable compression, while "zstd:1" would set `+
+				"zstd compression at level 1.").
+		Flag("goroutines",
+			"The number of goroutines to use in badger.Stream.").
+		Flag("cache-mb",
+			"Total size of cache (in MB) per shard in the reducer.").
+		Flag("cache-percentage",
+			"Cache percentages summing up to 100 for various caches. (FORMAT: BlockCacheSize,"+
+				"IndexCacheSize)").
+		String())
+
 	x.RegisterClientTLSFlags(flag)
 	// Encryption and Vault options
 	enc.RegisterFlags(flag)
 }
 
 func run() {
-	ctype, clevel := x.ParseCompression(Bulk.Conf.GetString("badger.compression"))
+	badger := z.NewSuperFlag(Bulk.Conf.GetString("badger")).MergeAndCheckDefault(
+		BulkBadgerDefaults)
+	ctype, clevel := x.ParseCompression(badger.GetString("compression"))
 	opt := options{
 		DataFiles:        Bulk.Conf.GetString("files"),
 		DataFormat:       Bulk.Conf.GetString("format"),
 		SchemaFile:       Bulk.Conf.GetString("schema"),
-		GqlSchemaFile:    Bulk.Conf.GetString("graphql-schema"),
+		GqlSchemaFile:    Bulk.Conf.GetString("graphql_schema"),
 		Encrypted:        Bulk.Conf.GetBool("encrypted"),
-		EncryptedOut:     Bulk.Conf.GetBool("encrypted-out"),
+		EncryptedOut:     Bulk.Conf.GetBool("encrypted_out"),
 		OutDir:           Bulk.Conf.GetString("out"),
-		ReplaceOutDir:    Bulk.Conf.GetBool("replace-out"),
+		ReplaceOutDir:    Bulk.Conf.GetBool("replace_out"),
 		TmpDir:           Bulk.Conf.GetString("tmp"),
-		NumGoroutines:    Bulk.Conf.GetInt("num-go-routines"),
-		MapBufSize:       uint64(Bulk.Conf.GetInt("mapoutput-mb")),
-		PartitionBufSize: int64(Bulk.Conf.GetInt("partition-mb")),
-		SkipMapPhase:     Bulk.Conf.GetBool("skip-map-phase"),
-		CleanupTmp:       Bulk.Conf.GetBool("cleanup-tmp"),
+		NumGoroutines:    Bulk.Conf.GetInt("num_go_routines"),
+		MapBufSize:       uint64(Bulk.Conf.GetInt("mapoutput_mb")),
+		PartitionBufSize: int64(Bulk.Conf.GetInt("partition_mb")),
+		SkipMapPhase:     Bulk.Conf.GetBool("skip_map_phase"),
+		CleanupTmp:       Bulk.Conf.GetBool("cleanup_tmp"),
 		NumReducers:      Bulk.Conf.GetInt("reducers"),
 		Version:          Bulk.Conf.GetBool("version"),
-		StoreXids:        Bulk.Conf.GetBool("store-xids"),
+		StoreXids:        Bulk.Conf.GetBool("store_xids"),
 		ZeroAddr:         Bulk.Conf.GetString("zero"),
 		HttpAddr:         Bulk.Conf.GetString("http"),
-		IgnoreErrors:     Bulk.Conf.GetBool("ignore-errors"),
-		MapShards:        Bulk.Conf.GetInt("map-shards"),
-		ReduceShards:     Bulk.Conf.GetInt("reduce-shards"),
-		CustomTokenizers: Bulk.Conf.GetString("custom-tokenizers"),
-		NewUids:          Bulk.Conf.GetBool("new-uids"),
+		IgnoreErrors:     Bulk.Conf.GetBool("ignore_errors"),
+		MapShards:        Bulk.Conf.GetInt("map_shards"),
+		ReduceShards:     Bulk.Conf.GetInt("reduce_shards"),
+		CustomTokenizers: Bulk.Conf.GetString("custom_tokenizers"),
+		NewUids:          Bulk.Conf.GetBool("new_uids"),
 		ClientDir:        Bulk.Conf.GetString("xidmap"),
+		Namespace:        Bulk.Conf.GetUint64("force-namespace"),
+
 		// Badger options
 		BadgerCompression:      ctype,
 		BadgerCompressionLevel: clevel,
@@ -158,38 +182,43 @@ func run() {
 	if opt.Version {
 		os.Exit(0)
 	}
-	if opt.BadgerCompressionLevel < 0 {
-		fmt.Printf("Invalid compression level: %d. It should be non-negative",
-			opt.BadgerCompressionLevel)
-	}
 
-	totalCache := int64(Bulk.Conf.GetInt("badger.cache-mb"))
+	totalCache := int64(badger.GetUint64("cache-mb"))
 	x.AssertTruef(totalCache >= 0, "ERROR: Cache size must be non-negative")
-	cachePercent, err := x.GetCachePercentages(Bulk.Conf.GetString("badger.cache-percentage"), 2)
+	cachePercent, err := x.GetCachePercentages(badger.GetString("cache-percentage"), 2)
 	x.Check(err)
 	totalCache <<= 20 // Convert to MB.
 	opt.BlockCacheSize = (cachePercent[0] * totalCache) / 100
 	opt.IndexCacheSize = (cachePercent[1] * totalCache) / 100
 
-	if opt.EncryptionKey, err = enc.ReadKey(Bulk.Conf); err != nil {
-		fmt.Printf("unable to read key %v", err)
-		return
-	}
+	_, opt.EncryptionKey = ee.GetKeys(Bulk.Conf)
 	if len(opt.EncryptionKey) == 0 {
 		if opt.Encrypted || opt.EncryptedOut {
-			fmt.Fprint(os.Stderr, "Must use --encryption-key-file or vault option(s).\n")
+			fmt.Fprint(os.Stderr, "Must use --encryption_key_file or vault option(s).\n")
 			os.Exit(1)
 		}
 	} else {
 		requiredFlags := Bulk.Cmd.Flags().Changed("encrypted") &&
-			Bulk.Cmd.Flags().Changed("encrypted-out")
+			Bulk.Cmd.Flags().Changed("encrypted_out")
 		if !requiredFlags {
-			fmt.Fprint(os.Stderr, "Must specify --encrypted and --encrypted-out when providing encryption key.\n")
+			fmt.Fprint(os.Stderr, "Must specify --encrypted and --encrypted_out when providing encryption key.\n")
 			os.Exit(1)
 		}
 		if !opt.Encrypted && !opt.EncryptedOut {
-			fmt.Fprint(os.Stderr, "Must set --encrypted and/or --encrypted-out to true when providing encryption key.\n")
+			fmt.Fprint(os.Stderr, "Must set --encrypted and/or --encrypted_out to true when providing encryption key.\n")
 			os.Exit(1)
+		}
+
+		tlsConf, err := x.LoadClientTLSConfigForInternalPort(Bulk.Conf)
+		x.Check(err)
+		// Need to set zero addr in WorkerConfig before checking the license.
+		x.WorkerConfig.ZeroAddr = []string{opt.ZeroAddr}
+		x.WorkerConfig.TLSClientConfig = tlsConf
+		if !worker.EnterpriseEnabled() {
+			// Crash since the enterprise license is not enabled..
+			log.Fatal("Enterprise License needed for the Encryption feature.")
+		} else {
+			log.Printf("Encryption feature enabled.")
 		}
 	}
 	fmt.Printf("Encrypted input: %v; Encrypted output: %v\n", opt.Encrypted, opt.EncryptedOut)
@@ -197,7 +226,8 @@ func run() {
 	if opt.SchemaFile == "" {
 		fmt.Fprint(os.Stderr, "Schema file must be specified.\n")
 		os.Exit(1)
-	} else if _, err := os.Stat(opt.SchemaFile); err != nil && os.IsNotExist(err) {
+	}
+	if !filestore.Exists(opt.SchemaFile) {
 		fmt.Fprintf(os.Stderr, "Schema path(%v) does not exist.\n", opt.SchemaFile)
 		os.Exit(1)
 	}
@@ -207,7 +237,7 @@ func run() {
 	} else {
 		fileList := strings.Split(opt.DataFiles, ",")
 		for _, file := range fileList {
-			if _, err := os.Stat(file); err != nil && os.IsNotExist(err) {
+			if !filestore.Exists(file) {
 				fmt.Fprintf(os.Stderr, "Data path(%v) does not exist.\n", file)
 				os.Exit(1)
 			}
@@ -215,12 +245,12 @@ func run() {
 	}
 
 	if opt.ReduceShards > opt.MapShards {
-		fmt.Fprintf(os.Stderr, "Invalid flags: reduce-shards(%d) should be <= map-shards(%d)\n",
+		fmt.Fprintf(os.Stderr, "Invalid flags: reduce_shards(%d) should be <= map_shards(%d)\n",
 			opt.ReduceShards, opt.MapShards)
 		os.Exit(1)
 	}
 	if opt.NumReducers > opt.ReduceShards {
-		fmt.Fprintf(os.Stderr, "Invalid flags: shufflers(%d) should be <= reduce-shards(%d)\n",
+		fmt.Fprintf(os.Stderr, "Invalid flags: shufflers(%d) should be <= reduce_shards(%d)\n",
 			opt.NumReducers, opt.ReduceShards)
 		os.Exit(1)
 	}
@@ -230,7 +260,7 @@ func run() {
 		}
 	}
 	if opt.MapBufSize <= 0 || opt.PartitionBufSize <= 0 {
-		fmt.Fprintf(os.Stderr, "mapoutput-mb: %d and partition-mb: %d must be greater than zero\n",
+		fmt.Fprintf(os.Stderr, "mapoutput_mb: %d and partition_mb: %d must be greater than zero\n",
 			opt.MapBufSize, opt.PartitionBufSize)
 		os.Exit(1)
 	}
@@ -247,6 +277,7 @@ func run() {
 	go func() {
 		log.Fatal(http.ListenAndServe(opt.HttpAddr, nil))
 	}()
+	http.HandleFunc("/jemalloc", x.JemallocHandler)
 
 	// Make sure it's OK to create or replace the directory specified with the --out option.
 	// It is always OK to create or replace the default output directory.
@@ -254,7 +285,7 @@ func run() {
 		err := x.IsMissingOrEmptyDir(opt.OutDir)
 		if err == nil {
 			fmt.Fprintf(os.Stderr, "Output directory exists and is not empty."+
-				" Use --replace-out to overwrite it.\n")
+				" Use --replace_out to overwrite it.\n")
 			os.Exit(1)
 		} else if err != x.ErrMissingDir {
 			x.CheckfNoTrace(err)
@@ -287,9 +318,43 @@ func run() {
 	defer os.RemoveAll(bufDir)
 
 	loader := newLoader(&opt)
-	if !opt.SkipMapPhase {
+
+	const bulkMetaFilename = "bulk.meta"
+	bulkMetaPath := filepath.Join(opt.TmpDir, bulkMetaFilename)
+
+	if opt.SkipMapPhase {
+		bulkMetaData, err := ioutil.ReadFile(bulkMetaPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading from bulk meta file")
+			os.Exit(1)
+		}
+
+		var bulkMeta pb.BulkMeta
+		if err = bulkMeta.Unmarshal(bulkMetaData); err != nil {
+			fmt.Fprintln(os.Stderr, "Error deserializing bulk meta file")
+			os.Exit(1)
+		}
+
+		loader.prog.mapEdgeCount = bulkMeta.EdgeCount
+		loader.schema.schemaMap = bulkMeta.SchemaMap
+	} else {
 		loader.mapStage()
 		mergeMapShardsIntoReduceShards(&opt)
+		loader.leaseNamespaces()
+
+		bulkMeta := pb.BulkMeta{
+			EdgeCount: loader.prog.mapEdgeCount,
+			SchemaMap: loader.schema.schemaMap,
+		}
+		bulkMetaData, err := bulkMeta.Marshal()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error serializing bulk meta file")
+			os.Exit(1)
+		}
+		if err = ioutil.WriteFile(bulkMetaPath, bulkMetaData, 0644); err != nil {
+			fmt.Fprintln(os.Stderr, "Error writing to bulk meta file")
+			os.Exit(1)
+		}
 	}
 	loader.reduceStage()
 	loader.writeSchema()
@@ -303,7 +368,7 @@ func maxOpenFilesWarning() {
 		yellow = "\x1b[33m"
 		reset  = "\x1b[0m"
 	)
-	maxOpenFiles, err := queryMaxOpenFiles()
+	maxOpenFiles, err := x.QueryMaxOpenFiles()
 	if err != nil || maxOpenFiles < 1e6 {
 		fmt.Println(green + "\nThe bulk loader needs to open many files at once. This number depends" +
 			" on the size of the data set loaded, the map file output size, and the level" +

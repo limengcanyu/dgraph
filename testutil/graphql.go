@@ -19,14 +19,13 @@ package testutil
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"testing"
 	"time"
-
-	"github.com/dgraph-io/dgraph/graphql/authorization"
 
 	"github.com/pkg/errors"
 
@@ -85,9 +84,21 @@ func MakeGQLRequest(t *testing.T, params *GraphQLParams) *GraphQLResponse {
 	return MakeGQLRequestWithAccessJwt(t, params, "")
 }
 
-func MakeGQLRequestWithAccessJwt(t *testing.T, params *GraphQLParams,
-	accessToken string) *GraphQLResponse {
-	adminUrl := "http://" + SockAddrHttp + "/admin"
+func MakeGQLRequestWithTLS(t *testing.T, params *GraphQLParams, tls *tls.Config) *GraphQLResponse {
+	return MakeGQLRequestWithAccessJwtAndTLS(t, params, tls, "")
+}
+
+func MakeGQLRequestWithAccessJwt(t *testing.T, params *GraphQLParams, accessToken string) *GraphQLResponse {
+	return MakeGQLRequestWithAccessJwtAndTLS(t, params, nil, accessToken)
+}
+
+func MakeGQLRequestWithAccessJwtAndTLS(t *testing.T, params *GraphQLParams, tls *tls.Config, accessToken string) *GraphQLResponse {
+	var adminUrl string
+	if tls != nil {
+		adminUrl = "https://" + SockAddrHttp + "/admin"
+	} else {
+		adminUrl = "http://" + SockAddrHttp + "/admin"
+	}
 
 	b, err := json.Marshal(params)
 	require.NoError(t, err)
@@ -99,6 +110,11 @@ func MakeGQLRequestWithAccessJwt(t *testing.T, params *GraphQLParams,
 		req.Header.Set("X-Dgraph-AccessToken", accessToken)
 	}
 	client := &http.Client{}
+	if tls != nil {
+		client.Transport = &http.Transport{
+			TLSClientConfig: tls,
+		}
+	}
 	resp, err := client.Do(req)
 	require.NoError(t, err)
 
@@ -111,6 +127,60 @@ func MakeGQLRequestWithAccessJwt(t *testing.T, params *GraphQLParams,
 	require.NoError(t, err)
 
 	return &gqlResp
+}
+
+func AssertRemoveNode(t *testing.T, nodeId uint64, groupId uint32) {
+	params := &GraphQLParams{
+		Query: `mutation ($nodeId: UInt64!, $groupId: UInt64!) {
+		  removeNode(input: {nodeId: $nodeId, groupId: $groupId}) {
+			response {
+				code
+			}
+		  }
+		}`,
+		Variables: map[string]interface{}{
+			"nodeId":  nodeId,
+			"groupId": groupId,
+		},
+	}
+	resp := MakeGQLRequest(t, params)
+	resp.RequireNoGraphQLErrors(t)
+	CompareJSON(t, `{"removeNode":{"response":{"code":"Success"}}}`, string(resp.Data))
+}
+
+func AssertMoveTablet(t *testing.T, tablet string, groupId uint32) {
+	params := &GraphQLParams{
+		Query: `mutation ($tablet: String!, $groupId: UInt64!) {
+		  moveTablet(input: {tablet: $tablet, groupId: $groupId}) {
+			response {
+				code
+			}
+		  }
+		}`,
+		Variables: map[string]interface{}{
+			"tablet":  tablet,
+			"groupId": groupId,
+		},
+	}
+	resp := MakeGQLRequest(t, params)
+	resp.RequireNoGraphQLErrors(t)
+	CompareJSON(t, `{"moveTablet":{"response":{"code":"Success"}}}`, string(resp.Data))
+}
+
+func EnterpriseLicense(t *testing.T, license string) *GraphQLResponse {
+	params := &GraphQLParams{
+		Query: `mutation ($license: String!) {
+		  enterpriseLicense(input: {license: $license}) {
+			response {
+				code
+			}
+		  }
+		}`,
+		Variables: map[string]interface{}{
+			"license": license,
+		},
+	}
+	return MakeGQLRequest(t, params)
 }
 
 type clientCustomClaims struct {
@@ -207,37 +277,38 @@ func (a *AuthMeta) AddClaimsToContext(ctx context.Context) (context.Context, err
 }
 
 func AppendAuthInfo(schema []byte, algo, publicKeyFile string, closedByDefault bool) ([]byte, error) {
-	authInfo := `# Dgraph.Authorization {"VerificationKey":"secretkey","Header":"X-Test-Auth","Namespace":"https://xyz.io/jwt/claims","Algo":"HS256","Audience":["aud1","63do0q16n6ebjgkumu05kkeian","aud5"],"ClosedByDefault":%s}`
-	if algo == "HS256" {
-		if closedByDefault {
-			authInfo = fmt.Sprintf(authInfo, "true")
-		} else {
-			authInfo = fmt.Sprintf(authInfo, "false")
-		}
-		return append(schema, []byte(authInfo)...), nil
-	}
+	authInfo := `# Dgraph.Authorization {"VerificationKey":"%s","Header":"X-Test-Auth","Namespace":"https://xyz.io/jwt/claims","Algo":"%s","Audience":["aud1","63do0q16n6ebjgkumu05kkeian","aud5"],"ClosedByDefault":%s}`
 
-	if algo != "RS256" {
-		return schema, nil
-	}
-
-	_, err := ioutil.ReadFile(publicKeyFile)
-	if err != nil {
-		return nil, err
-	}
-
-	// Replacing ASCII newline with "\n" as the authorization information in the schema should be
-	// present in a single line.
+	closedByDefaultStr := "false"
 	if closedByDefault {
-		authInfo = fmt.Sprintf(authInfo, "true")
-	} else {
-		authInfo = fmt.Sprintf(authInfo, "false")
+		closedByDefaultStr = "true"
 	}
+
+	var verificationKey string
+	switch algo {
+	case "HS256":
+		verificationKey = "secretkey"
+	case "RS256":
+		keyData, err := ioutil.ReadFile(publicKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		// Replacing ASCII newline with "\n" as the authorization information in the schema
+		// should be present in a single line.
+		verificationKey = string(bytes.ReplaceAll(keyData, []byte{10}, []byte{92, 110}))
+	}
+
+	authInfo = fmt.Sprintf(authInfo, verificationKey, algo, closedByDefaultStr)
 	return append(schema, []byte(authInfo)...), nil
 }
 
 func AppendAuthInfoWithJWKUrl(schema []byte) ([]byte, error) {
-	authInfo := `# Dgraph.Authorization {"VerificationKey":"","Header":"X-Test-Auth","jwkurl":"https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com", "Namespace":"https://xyz.io/jwt/claims","Algo":"","Audience":["fir-project1-259e7"]}`
+	authInfo := `#   Dgraph.Authorization {"VerificationKey":"","Header":"X-Test-Auth","jwkurl":"https://dev-hr2kugfp.us.auth0.com/.well-known/jwks.json", "Namespace":"https://xyz.io/jwt/claims","Algo":"","Audience":[ "HhaXkQVRBn5e0K3DmMp2zbjI8i1wcv2e"]}`
+	return append(schema, []byte(authInfo)...), nil
+}
+
+func AppendAuthInfoWithMultipleJWKUrls(schema []byte) ([]byte, error) {
+	authInfo := `#   Dgraph.Authorization {"VerificationKey":"","Header":"X-Test-Auth","jwkurls":["https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com","https://dev-hr2kugfp.us.auth0.com/.well-known/jwks.json"], "Namespace":"https://xyz.io/jwt/claims","Algo":"","Audience":["fir-project1-259e7", "HhaXkQVRBn5e0K3DmMp2zbjI8i1wcv2e"]}`
 	return append(schema, []byte(authInfo)...), nil
 }
 
@@ -249,15 +320,6 @@ func AppendAuthInfoWithJWKUrlAndWithoutAudience(schema []byte) ([]byte, error) {
 // Add JWKUrl and (VerificationKey, Algo) in the same Authorization JSON
 // Adding Dummy values as this should result in validation error
 func AppendJWKAndVerificationKey(schema []byte) ([]byte, error) {
-	authInfo := `# Dgraph.Authorization {"VerificationKey":"some-key","Header":"X-Test-Auth","jwkurl":"some-url", "Namespace":"https://xyz.io/jwt/claims","Algo":"algo","Audience":["fir-project1-259e7"]}`
+	authInfo := `#Dgraph.Authorization{"VerificationKey":"some-key","Header":"X-Test-Auth","jwkurl":"some-url", "Namespace":"https://xyz.io/jwt/claims","Algo":"algo","Audience":["fir-project1-259e7"]}`
 	return append(schema, []byte(authInfo)...), nil
-}
-
-func SetAuthMeta(strSchema string) *authorization.AuthMeta {
-	authMeta, err := authorization.Parse(strSchema)
-	if err != nil {
-		panic(err)
-	}
-	authorization.SetAuthMeta(authMeta)
-	return authMeta
 }

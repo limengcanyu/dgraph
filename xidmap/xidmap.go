@@ -26,7 +26,7 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v3"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/ristretto/z"
@@ -91,7 +91,7 @@ func New(zero *grpc.ClientConn, db *badger.DB, dir string) *XidMap {
 	}
 	for i := range xm.shards {
 		xm.shards[i] = &shard{
-			tree: z.NewTree("", 100<<20),
+			tree: z.NewTree(),
 		}
 	}
 
@@ -138,7 +138,7 @@ func New(zero *grpc.ClientConn, db *badger.DB, dir string) *XidMap {
 		backoff := initBackoff
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			assigned, err := xm.zc.AssignUids(ctx, &pb.Num{Val: 1e5})
+			assigned, err := xm.zc.AssignIds(ctx, &pb.Num{Val: 1e5, Type: pb.Num_UID})
 			glog.V(2).Infof("Assigned Uids: %+v. Err: %v", assigned, err)
 			cancel()
 			if err == nil {
@@ -255,7 +255,7 @@ func (m *XidMap) BumpTo(uid uint64) {
 		glog.V(1).Infof("Bumping up to %v", uid)
 		num := x.Max(uid-curMax, 1e4)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		assigned, err := m.zc.AssignUids(ctx, &pb.Num{Val: num})
+		assigned, err := m.zc.AssignIds(ctx, &pb.Num{Val: num, Type: pb.Num_UID})
 		cancel()
 		if err == nil {
 			glog.V(1).Infof("Requested bump: %d. Got assigned: %v", uid, assigned)
@@ -276,22 +276,25 @@ func (m *XidMap) AllocateUid() uint64 {
 
 // Flush must be called if DB is provided to XidMap.
 func (m *XidMap) Flush() error {
+	// While running bulk loader, this method is called at the completion of map phase. After this
+	// method returns xidmap of bulk loader is made nil. But xidmap still show up in memory profiles
+	// even during reduce phase. If bulk loader is running on large dataset, this occupies lot of
+	// memory and causing OOM sometimes. Making shards explicitly nil in this method fixes this.
+	// TODO: find why xidmap is not getting GCed without below line.
+	m.shards = nil
+	if m.writer == nil {
+		return nil
+	}
 	glog.Infof("Writing xid map to DB")
 	defer func() {
 		glog.Infof("Finished writing xid map to DB")
 	}()
 
-	if m.writer != nil && len(m.kvBuf) > 0 {
+	if len(m.kvBuf) > 0 {
 		m.kvChan <- m.kvBuf
 	}
 	close(m.kvChan)
 	m.wg.Wait()
-	for _, shard := range m.shards {
-		shard.tree.Release()
-	}
 
-	if m.writer == nil {
-		return nil
-	}
 	return m.writer.Flush()
 }

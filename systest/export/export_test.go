@@ -76,30 +76,21 @@ func TestExportSchemaToMinio(t *testing.T) {
 	require.Equal(t, expectedSchema, string(bytes))
 }
 
-var expectedSchema = `<movie>:string .` + " " + `
-<dgraph.cors>:[string] @index(exact) @upsert .` + " " + `
-<dgraph.type>:[string] @index(exact) .` + " " + `
-<dgraph.drop.op>:string .` + " " + `
-<dgraph.graphql.xid>:string @index(exact) @upsert .` + " " + `
-<dgraph.graphql.schema>:string .` + " " + `
-<dgraph.graphql.p_query>:string .` + " " + `
-<dgraph.graphql.p_sha256hash>:string @index(exact) .` + " " + `
-<dgraph.graphql.schema_history>:string .` + " " + `
-<dgraph.graphql.schema_created_at>:datetime .` + " " + `
-type <Node> {
+var expectedSchema = `[0x0] <movie>:string .` + " " + `
+[0x0] <dgraph.type>:[string] @index(exact) .` + " " + `
+[0x0] <dgraph.drop.op>:string .` + " " + `
+[0x0] <dgraph.graphql.xid>:string @index(exact) @upsert .` + " " + `
+[0x0] <dgraph.graphql.schema>:string .` + " " + `
+[0x0] <dgraph.graphql.p_query>:string @index(sha256) .` + " " + `
+[0x0] type <Node> {
 	movie
 }
-type <dgraph.graphql> {
+[0x0] type <dgraph.graphql> {
 	dgraph.graphql.schema
 	dgraph.graphql.xid
 }
-type <dgraph.graphql.history> {
-	dgraph.graphql.schema_history
-	dgraph.graphql.schema_created_at
-}
-type <dgraph.graphql.persisted_query> {
+[0x0] type <dgraph.graphql.persisted_query> {
 	dgraph.graphql.p_query
-	dgraph.graphql.p_sha256hash
 }
 `
 
@@ -109,10 +100,11 @@ func setupDgraph(t *testing.T) {
 	dg := dgo.NewDgraphClient(api.NewDgraphClient(conn))
 
 	ctx := context.Background()
-	require.NoError(t, dg.Alter(ctx, &api.Operation{DropAll: true}))
+	require.NoError(t, testutil.RetryAlter(dg, &api.Operation{DropAll: true}))
 
 	// Add schema and types.
-	require.NoError(t, dg.Alter(ctx, &api.Operation{Schema: `movie: string .
+	// this is because Alters are always blocked until the indexing is finished.
+	require.NoError(t, testutil.RetryAlter(dg, &api.Operation{Schema: `movie: string .
 		type Node {
 			movie
 		}`}))
@@ -142,7 +134,7 @@ func requestExport(t *testing.T) map[string]interface{} {
 		}
 	}`
 
-	adminUrl := "http://"+ testutil.SockAddrHttp+ "/admin"
+	adminUrl := "http://" + testutil.SockAddrHttp + "/admin"
 	params := testutil.GraphQLParams{
 		Query: exportRequest,
 		Variables: map[string]interface{}{

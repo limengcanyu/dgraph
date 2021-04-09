@@ -27,16 +27,30 @@ import (
 // AsString writes query as an indented dql query string.  AsString doesn't
 // validate query, and so doesn't return an error if query is 'malformed' - it might
 // just write something that wouldn't parse as a Dgraph query.
-func AsString(query *gql.GraphQuery) string {
-	if query == nil {
+func AsString(queries []*gql.GraphQuery) string {
+	if queries == nil {
 		return ""
 	}
 
 	var b strings.Builder
 	x.Check2(b.WriteString("query {\n"))
-	writeQuery(&b, query, "  ")
+	numRewrittenQueries := 0
+	for _, q := range queries {
+		if q == nil {
+			// Don't call writeQuery on a nil query
+			continue
+		}
+		writeQuery(&b, q, "  ")
+		numRewrittenQueries++
+	}
 	x.Check2(b.WriteString("}"))
 
+	if numRewrittenQueries == 0 {
+		// In case writeQuery has not been called on any query or all queries
+		// are nil. Then, return empty string. This case needs to be considered as
+		// we don't want to return query{} in this case.
+		return ""
+	}
 	return b.String()
 }
 
@@ -123,7 +137,8 @@ func writeUIDFunc(b *strings.Builder, uids []uint64, args []gql.Arg) {
 // writeRoot writes the root function as well as any ordering and paging
 // specified in q.
 //
-// Only uid(0x123, 0x124) and type(...) functions are supported at root.
+// Only uid(0x123, 0x124), type(...) and eq(Type.Predicate, ...) functions are supported at root.
+// Multiple arguments for `eq` filter will be required in case of resolving `entities` query.
 func writeRoot(b *strings.Builder, q *gql.GraphQuery) {
 	if q.Func == nil {
 		return
@@ -135,9 +150,10 @@ func writeRoot(b *strings.Builder, q *gql.GraphQuery) {
 		writeUIDFunc(b, q.Func.UID, q.Func.Args)
 	case q.Func.Name == "type" && len(q.Func.Args) == 1:
 		x.Check2(b.WriteString(fmt.Sprintf("(func: type(%s)", q.Func.Args[0].Value)))
-	case q.Func.Name == "eq" && len(q.Func.Args) == 2:
-		x.Check2(b.WriteString(fmt.Sprintf("(func: eq(%s, %s)", q.Func.Args[0].Value,
-			q.Func.Args[1].Value)))
+	case q.Func.Name == "eq":
+		x.Check2(b.WriteString("(func: eq("))
+		writeFilterArguments(b, q.Func.Args)
+		x.Check2(b.WriteRune(')'))
 	}
 	writeOrderAndPage(b, q, true)
 	x.Check2(b.WriteRune(')'))
@@ -203,7 +219,7 @@ func writeOrderAndPage(b *strings.Builder, query *gql.GraphQuery, root bool) {
 	var wroteOrder, wroteFirst bool
 
 	for _, ord := range query.Order {
-		if root {
+		if root || wroteOrder {
 			x.Check2(b.WriteString(", "))
 		}
 		if ord.Desc {

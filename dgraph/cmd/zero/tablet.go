@@ -72,6 +72,52 @@ func (s *Server) rebalanceTablets() {
 	}
 }
 
+// MoveTablet can be used to move a tablet to a specific group.
+// It takes in tablet and destination group as argument.
+// It returns a *pb.Status to be used by the `/moveTablet` HTTP handler in Zero.
+func (s *Server) MoveTablet(ctx context.Context, req *pb.MoveTabletRequest) (*pb.Status, error) {
+	if !s.Node.AmLeader() {
+		return &pb.Status{Code: 1, Msg: x.Error}, errNotLeader
+	}
+
+	knownGroups := s.KnownGroups()
+	var isKnown bool
+	for _, grp := range knownGroups {
+		if grp == req.DstGroup {
+			isKnown = true
+			break
+		}
+	}
+	if !isKnown {
+		return &pb.Status{Code: 1, Msg: x.ErrorInvalidRequest},
+			fmt.Errorf("Group: [%d] is not a known group.", req.DstGroup)
+	}
+
+	tablet := x.NamespaceAttr(req.Namespace, req.Tablet)
+	tab := s.ServingTablet(tablet)
+	if tab == nil {
+		return &pb.Status{Code: 1, Msg: x.ErrorInvalidRequest},
+			fmt.Errorf("namespace: %d. No tablet found for: %s", req.Namespace, req.Tablet)
+	}
+
+	srcGroup := tab.GroupId
+	if srcGroup == req.DstGroup {
+		return &pb.Status{Code: 1, Msg: x.ErrorInvalidRequest},
+			fmt.Errorf("namespace: %d. Tablet: [%s] is already being served by group: [%d]",
+				req.Namespace, req.Tablet, srcGroup)
+	}
+
+	if err := s.movePredicate(tablet, srcGroup, req.DstGroup); err != nil {
+		glog.Errorf("namespace: %d. While moving predicate %s from %d -> %d. Error: %v",
+			req.Namespace, req.Tablet, srcGroup, req.DstGroup, err)
+		return &pb.Status{Code: 1, Msg: x.Error}, err
+	}
+
+	return &pb.Status{Code: 0, Msg: fmt.Sprintf("namespace: %d. "+
+		"Predicate: [%s] moved from group [%d] to [%d]", req.Namespace, req.Tablet, srcGroup,
+		req.DstGroup)}, nil
+}
+
 // movePredicate is the main entry point for move predicate logic. This Zero must remain the leader
 // for the entire duration of predicate move. If this Zero stops being the leader, the final
 // proposal of reassigning the tablet to the destination would fail automatically.
@@ -103,8 +149,9 @@ func (s *Server) movePredicate(predicate string, srcGroup, dstGroup uint32) erro
 	if tab == nil {
 		return errors.Errorf("Tablet to be moved: [%v] is not being served", predicate)
 	}
-	msg := fmt.Sprintf("Going to move predicate: [%v], size: [%v] from group %d to %d\n", predicate,
-		humanize.Bytes(uint64(tab.Space)), srcGroup, dstGroup)
+	msg := fmt.Sprintf("Going to move predicate: [%v], size: [ondisk: %v, uncompressed: %v]"+
+		" from group %d to %d\n", predicate, humanize.IBytes(uint64(tab.OnDiskBytes)),
+		humanize.IBytes(uint64(tab.UncompressedBytes)), srcGroup, dstGroup)
 	glog.Info(msg)
 	span.Annotate([]otrace.Attribute{otrace.StringAttribute("tablet", predicate)}, msg)
 
@@ -139,11 +186,12 @@ func (s *Server) movePredicate(predicate string, srcGroup, dstGroup uint32) erro
 
 	p := &pb.ZeroProposal{}
 	p.Tablet = &pb.Tablet{
-		GroupId:   dstGroup,
-		Predicate: predicate,
-		Space:     tab.Space,
-		Force:     true,
-		MoveTs:    in.TxnTs,
+		GroupId:           dstGroup,
+		Predicate:         predicate,
+		OnDiskBytes:       tab.OnDiskBytes,
+		UncompressedBytes: tab.UncompressedBytes,
+		Force:             true,
+		MoveTs:            in.TxnTs,
 	}
 	msg = fmt.Sprintf("Move at Alpha done. Now proposing: %+v", p)
 	span.Annotate(nil, msg)
@@ -197,7 +245,7 @@ func (s *Server) chooseTablet() (predicate string, srcGroup uint32, dstGroup uin
 	for k, v := range s.state.Groups {
 		space := int64(0)
 		for _, tab := range v.Tablets {
-			space += tab.Space
+			space += tab.OnDiskBytes
 		}
 		groups = append(groups, kv{k, space})
 	}
@@ -233,9 +281,9 @@ func (s *Server) chooseTablet() (predicate string, srcGroup uint32, dstGroup uin
 
 			// Finds a tablet as big a possible such that on moving it dstGroup's size is
 			// less than or equal to srcGroup.
-			if tab.Space <= sizeDiff/2 && tab.Space > size {
+			if tab.OnDiskBytes <= sizeDiff/2 && tab.OnDiskBytes > size {
 				predicate = tab.Predicate
-				size = tab.Space
+				size = tab.OnDiskBytes
 			}
 		}
 		if len(predicate) > 0 {

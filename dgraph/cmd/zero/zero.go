@@ -17,9 +17,9 @@
 package zero
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
-	"io"
 	"math"
 	"strings"
 	"sync"
@@ -59,10 +59,9 @@ type Server struct {
 	state       *pb.MembershipState
 	nextRaftId  uint64
 
-	nextLeaseId uint64
-	nextTxnTs   uint64
-	readOnlyTs  uint64
-	leaseLock   sync.Mutex // protects nextLeaseId, nextTxnTs and corresponding proposals.
+	nextLease  map[pb.NumLeaseType]uint64
+	readOnlyTs uint64
+	leaseLock  sync.Mutex // protects nextUID, nextTxnTs, nextNsID and corresponding proposals.
 
 	// groupMap    map[uint32]*Group
 	nextGroup      uint32
@@ -75,6 +74,8 @@ type Server struct {
 
 	moveOngoing    chan struct{}
 	blockCommitsOn *sync.Map
+
+	checkpointPerGroup map[uint32]uint64
 }
 
 // Init initializes the zero server.
@@ -88,14 +89,17 @@ func (s *Server) Init() {
 		Groups: make(map[uint32]*pb.Group),
 		Zeros:  make(map[uint64]*pb.Member),
 	}
+	s.nextLease = make(map[pb.NumLeaseType]uint64)
 	s.nextRaftId = 1
-	s.nextLeaseId = 1
-	s.nextTxnTs = 1
+	s.nextLease[pb.Num_UID] = 1
+	s.nextLease[pb.Num_TXN_TS] = 1
+	s.nextLease[pb.Num_NS_ID] = 1
 	s.nextGroup = 1
 	s.leaderChangeCh = make(chan struct{}, 1)
 	s.closer = z.NewCloser(2) // grpc and http
 	s.blockCommitsOn = new(sync.Map)
 	s.moveOngoing = make(chan struct{}, 1)
+	s.checkpointPerGroup = make(map[uint32]uint64)
 
 	go s.rebalanceTablets()
 }
@@ -346,7 +350,7 @@ func (s *Server) createProposals(dst *pb.Group) ([]*pb.ZeroProposal, error) {
 
 	s.RLock()
 	defer s.RUnlock()
-	// There is only one member.
+	// There is only one member. We use for loop because we don't know what the mid is.
 	for mid, dstMember := range dst.Members {
 		group, has := s.state.Groups[dstMember.GroupId]
 		if !has {
@@ -385,8 +389,8 @@ func (s *Server) createProposals(dst *pb.Group) ([]*pb.ZeroProposal, error) {
 			continue
 		}
 
-		s := float64(srcTablet.Space)
-		d := float64(dstTablet.Space)
+		s := float64(srcTablet.OnDiskBytes)
+		d := float64(dstTablet.OnDiskBytes)
 		if dstTablet.Remove || (s == 0 && d > 0) || (s > 0 && math.Abs(d/s-1) > 0.1) {
 			dstTablet.Force = false
 			proposal := &pb.ZeroProposal{
@@ -398,26 +402,32 @@ func (s *Server) createProposals(dst *pb.Group) ([]*pb.ZeroProposal, error) {
 	return res, nil
 }
 
-// removeNode removes the given node from the given group.
+// RemoveNode removes the given node from the given group.
 // It's the user's responsibility to ensure that node doesn't come back again
 // before calling the api.
-func (s *Server) removeNode(ctx context.Context, nodeId uint64, groupId uint32) error {
-	if groupId == 0 {
-		return s.Node.ProposePeerRemoval(ctx, nodeId)
+func (s *Server) RemoveNode(ctx context.Context, req *pb.RemoveNodeRequest) (*pb.Status, error) {
+	if req.GroupId == 0 {
+		return nil, s.Node.ProposePeerRemoval(ctx, req.NodeId)
 	}
 	zp := &pb.ZeroProposal{}
-	zp.Member = &pb.Member{Id: nodeId, GroupId: groupId, AmDead: true}
-	if _, ok := s.state.Groups[groupId]; !ok {
-		return errors.Errorf("No group with groupId %d found", groupId)
+	zp.Member = &pb.Member{Id: req.NodeId, GroupId: req.GroupId, AmDead: true}
+	if _, ok := s.state.Groups[req.GroupId]; !ok {
+		return nil, errors.Errorf("No group with groupId %d found", req.GroupId)
 	}
-	if _, ok := s.state.Groups[groupId].Members[nodeId]; !ok {
-		return errors.Errorf("No node with nodeId %d found in group %d", nodeId, groupId)
+	if _, ok := s.state.Groups[req.GroupId].Members[req.NodeId]; !ok {
+		return nil, errors.Errorf("No node with nodeId %d found in group %d", req.NodeId,
+			req.GroupId)
 	}
-	if len(s.state.Groups[groupId].Members) == 1 && len(s.state.Groups[groupId].Tablets) > 0 {
-		return errors.Errorf("Move all tablets from group %d before removing the last node", groupId)
+	if len(s.state.Groups[req.GroupId].Members) == 1 && len(s.state.Groups[req.GroupId].
+		Tablets) > 0 {
+		return nil, errors.Errorf("Move all tablets from group %d before removing the last node",
+			req.GroupId)
+	}
+	if err := s.Node.proposeAndWait(ctx, zp); err != nil {
+		return nil, err
 	}
 
-	return s.Node.proposeAndWait(ctx, zp)
+	return &pb.Status{}, nil
 }
 
 // Connect is used by Alpha nodes to connect the very first time with group zero.
@@ -437,6 +447,13 @@ func (s *Server) Connect(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+
+	if m.Learner && !ms.License.GetEnabled() {
+		// Update the "ShouldCrash" function in x/x.go if you change the error message here.
+		return nil, errors.New("ENTERPRISE_ONLY_LEARNER - Missing or expired Enterpise License. " +
+			"Cannot add Learner Node.")
+	}
+
 	if m.ClusterInfoOnly {
 		// This request only wants to access the membership state, and nothing else. Most likely
 		// from our clients.
@@ -528,6 +545,12 @@ func (s *Server) Connect(ctx context.Context,
 				return proposal
 			}
 
+			if m.Learner {
+				// Give it the group it wants.
+				proposal.Member = m
+				return proposal
+			}
+
 			// We don't have this server in the list.
 			if len(group.Members) < s.NumReplicas {
 				// We need more servers here, so let's add it.
@@ -579,6 +602,12 @@ func (s *Server) Connect(ctx context.Context,
 		Member: m,
 	}
 	return resp, nil
+}
+
+// DeleteNamespace removes the tablets for deleted namespace from the membership state.
+func (s *Server) DeleteNamespace(ctx context.Context, in *pb.DeleteNsRequest) (*pb.Status, error) {
+	err := s.Node.proposeAndWait(ctx, &pb.ZeroProposal{DeleteNs: in})
+	return &pb.Status{}, err
 }
 
 // ShouldServe returns the tablet serving the predicate passed in the request.
@@ -635,6 +664,14 @@ func (s *Server) ShouldServe(
 
 // UpdateMembership updates the membership of the given group.
 func (s *Server) UpdateMembership(ctx context.Context, group *pb.Group) (*api.Payload, error) {
+	// Only Zero leader would get these membership updates.
+	if ts := group.GetCheckpointTs(); ts > 0 {
+		for _, m := range group.GetMembers() {
+			s.Lock()
+			s.checkpointPerGroup[m.GetGroupId()] = ts
+			s.Unlock()
+		}
+	}
 	proposals, err := s.createProposals(group)
 	if err != nil {
 		// Sleep here so the caller doesn't keep on retrying indefinitely, creating a busy
@@ -771,10 +808,12 @@ func (s *Server) latestMembershipState(ctx context.Context) (*pb.MembershipState
 	return ms, nil
 }
 
-func (s *Server) applyLicense(ctx context.Context, signedData io.Reader) error {
+func (s *Server) ApplyLicense(ctx context.Context, req *pb.ApplyLicenseRequest) (*pb.Status,
+	error) {
 	var l license
+	signedData := bytes.NewReader(req.License)
 	if err := verifySignature(signedData, strings.NewReader(publicKey), &l); err != nil {
-		return errors.Wrapf(err, "while extracting enterprise details from the license")
+		return nil, errors.Wrapf(err, "while extracting enterprise details from the license")
 	}
 
 	numNodes := len(s.state.GetZeros())
@@ -782,8 +821,8 @@ func (s *Server) applyLicense(ctx context.Context, signedData io.Reader) error {
 		numNodes += len(group.GetMembers())
 	}
 	if uint64(numNodes) > l.MaxNodes {
-		return errors.Errorf("Your license only allows [%v] (Alpha + Zero) nodes. You have: [%v].",
-			l.MaxNodes, numNodes)
+		return nil, errors.Errorf("Your license only allows [%v] (Alpha + Zero) nodes. "+
+			"You have: [%v].", l.MaxNodes, numNodes)
 	}
 
 	proposal := &pb.ZeroProposal{
@@ -796,8 +835,8 @@ func (s *Server) applyLicense(ctx context.Context, signedData io.Reader) error {
 
 	err := s.Node.proposeAndWait(ctx, proposal)
 	if err != nil {
-		return errors.Wrapf(err, "while proposing enterprise license state to cluster")
+		return nil, errors.Wrapf(err, "while proposing enterprise license state to cluster")
 	}
 	glog.Infof("Enterprise license proposed to the cluster %+v", proposal)
-	return nil
+	return &pb.Status{}, nil
 }

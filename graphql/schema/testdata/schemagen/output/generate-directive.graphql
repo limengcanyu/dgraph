@@ -195,7 +195,7 @@ directive @hasInverse(field: String!) on FIELD_DEFINITION
 directive @search(by: [DgraphIndex!]) on FIELD_DEFINITION
 directive @dgraph(type: String, pred: String) on OBJECT | INTERFACE | FIELD_DEFINITION
 directive @id on FIELD_DEFINITION
-directive @withSubscription on OBJECT | INTERFACE
+directive @withSubscription on OBJECT | INTERFACE | FIELD_DEFINITION
 directive @secret(field: String!, pred: String) on OBJECT | INTERFACE
 directive @auth(
 	password: AuthRule
@@ -205,8 +205,10 @@ directive @auth(
 	delete: AuthRule) on OBJECT | INTERFACE
 directive @custom(http: CustomHTTP, dql: String) on FIELD_DEFINITION
 directive @remote on OBJECT | INTERFACE | UNION | INPUT_OBJECT | ENUM
+directive @remoteResponse(name: String) on FIELD_DEFINITION
 directive @cascade(fields: [String]) on FIELD
 directive @lambda on FIELD_DEFINITION
+directive @lambdaOnMutate(add: Boolean, update: Boolean, delete: Boolean) on OBJECT | INTERFACE
 directive @cacheControl(maxAge: Int!) on QUERY
 directive @generate(
 	query: GenerateQueryParams,
@@ -215,6 +217,7 @@ directive @generate(
 
 input IntFilter {
 	eq: Int
+	in: [Int]
 	le: Int
 	lt: Int
 	ge: Int
@@ -224,6 +227,7 @@ input IntFilter {
 
 input Int64Filter {
 	eq: Int64
+	in: [Int64]
 	le: Int64
 	lt: Int64
 	ge: Int64
@@ -233,6 +237,7 @@ input Int64Filter {
 
 input FloatFilter {
 	eq: Float
+	in: [Float]
 	le: Float
 	lt: Float
 	ge: Float
@@ -242,6 +247,7 @@ input FloatFilter {
 
 input DateTimeFilter {
 	eq: DateTime
+	in: [DateTime]
 	le: DateTime
 	lt: DateTime
 	ge: DateTime
@@ -289,6 +295,8 @@ type AddHumanPayload {
 
 type CharacterAggregateResult {
 	count: Int
+	nameMin: String
+	nameMax: String
 }
 
 type DeleteCharacterPayload {
@@ -305,10 +313,18 @@ type DeleteHumanPayload {
 
 type HumanAggregateResult {
 	count: Int
+	nameMin: String
+	nameMax: String
+	totalCreditsMin: Int
+	totalCreditsMax: Int
+	totalCreditsSum: Int
+	totalCreditsAvg: Float
 }
 
 type PersonAggregateResult {
 	count: Int
+	nameMin: String
+	nameMax: String
 }
 
 type UpdateCharacterPayload {
@@ -372,7 +388,7 @@ input AddHumanInput {
 input CharacterFilter {
 	id: [ID!]
 	name: StringExactFilter
-	has: CharacterHasFilter
+	has: [CharacterHasFilter]
 	and: [CharacterFilter]
 	or: [CharacterFilter]
 	not: CharacterFilter
@@ -397,7 +413,7 @@ input CharacterRef {
 input HumanFilter {
 	id: [ID!]
 	name: StringExactFilter
-	has: HumanHasFilter
+	has: [HumanHasFilter]
 	and: [HumanFilter]
 	or: [HumanFilter]
 	not: HumanFilter
@@ -426,7 +442,7 @@ input HumanRef {
 
 input PersonFilter {
 	id: [ID!]
-	has: PersonHasFilter
+	has: [PersonHasFilter]
 	and: [PersonFilter]
 	or: [PersonFilter]
 	not: PersonFilter

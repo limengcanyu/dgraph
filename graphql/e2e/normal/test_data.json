@@ -86,7 +86,7 @@
         "Post.text": "this post is not worth publishing",
         "Post.tags": ["Random"],
         "Post.topic": "Random",
-        "Post.numLikes": 0,
+        "Post.numLikes": 1,
         "Post.numViews": 0,
         "Post.isPublished": false,
         "Post.postType": "Fact",
@@ -130,5 +130,18 @@
         "dgraph.type": "Country",
         "Country.name": "India",
         "Country.states": [{ "uid": "_:mh" }, { "uid": "_:gj" }, { "uid":  "_:ka"}]
+    },
+    {
+        "uid": "_:book1",
+        "dgraph.type": "Book",
+        "Book.bookId": 1234567890,
+        "Book.name": "Dgraph and Graphql",
+        "Book.desc": "All love between dgraph and graphql"
+    },
+    {
+        "uid": "_:chapter1",
+        "dgraph.type": "Chapter",
+        "Chapter.chapterId": 1,
+        "Chapter.name": "How Dgraph Works"
     }
 ]

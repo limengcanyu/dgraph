@@ -19,6 +19,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 
 	"github.com/dgraph-io/dgraph/graphql/resolve"
 	"github.com/dgraph-io/dgraph/graphql/schema"
@@ -27,7 +28,7 @@ import (
 )
 
 type configInput struct {
-	CacheMb float64
+	CacheMb *float64
 	// LogRequest is used to update WorkerOptions.LogRequest. true value of LogRequest enables
 	// logging of all requests coming to alphas. LogRequest type has been kept as *bool instead of
 	// bool to avoid updating WorkerOptions.LogRequest when it has default value of false.
@@ -42,8 +43,11 @@ func resolveUpdateConfig(ctx context.Context, m schema.Mutation) (*resolve.Resol
 		return resolve.EmptyResult(m, err), false
 	}
 
-	if err = worker.UpdateCacheMb(int64(input.CacheMb)); err != nil {
-		return resolve.EmptyResult(m, err), false
+	// update cacheMB only when it is specified by user
+	if input.CacheMb != nil {
+		if err = worker.UpdateCacheMb(int64(*input.CacheMb)); err != nil {
+			return resolve.EmptyResult(m, err), false
+		}
 	}
 
 	// input.LogRequest will be nil, when it is not specified explicitly in config request.
@@ -51,22 +55,23 @@ func resolveUpdateConfig(ctx context.Context, m schema.Mutation) (*resolve.Resol
 		worker.UpdateLogRequest(*input.LogRequest)
 	}
 
-	return &resolve.Resolved{
-		Data:  map[string]interface{}{m.Name(): response("Success", "Config updated successfully")},
-		Field: m,
-	}, true
+	return resolve.DataResult(
+		m,
+		map[string]interface{}{m.Name(): response("Success", "Config updated successfully")},
+		nil,
+	), true
 }
 
 func resolveGetConfig(ctx context.Context, q schema.Query) *resolve.Resolved {
 	glog.Info("Got config query through GraphQL admin API")
 
-	conf := make(map[string]interface{})
-	conf["cacheMb"] = float64(worker.Config.CacheMb)
-
-	return &resolve.Resolved{
-		Data:  map[string]interface{}{q.Name(): conf},
-		Field: q,
-	}
+	return resolve.DataResult(
+		q,
+		map[string]interface{}{q.Name(): map[string]interface{}{
+			"cacheMb": json.Number(strconv.FormatInt(worker.Config.CacheMb, 10)),
+		}},
+		nil,
+	)
 
 }
 

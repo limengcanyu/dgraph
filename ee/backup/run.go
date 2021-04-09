@@ -13,20 +13,26 @@
 package backup
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 
-	"google.golang.org/grpc/credentials"
+	bpb "github.com/dgraph-io/badger/v3/pb"
+	"github.com/golang/glog"
 
+	"github.com/dgraph-io/dgraph/ee"
 	"github.com/dgraph-io/dgraph/ee/enc"
+	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/worker"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
 )
 
 // Restore is the sub-command used to restore a backup.
@@ -39,129 +45,28 @@ var ExportBackup x.SubCommand
 
 var opt struct {
 	backupId    string
+	badger      string
 	location    string
 	pdir        string
 	zero        string
-	key         x.SensitiveByteSlice
+	key         x.Sensitive
 	forceZero   bool
 	destination string
 	format      string
+	verbose     bool
+	upgrade     bool // used by export backup command.
 }
 
 func init() {
-	initRestore()
 	initBackupLs()
 	initExportBackup()
-}
-
-func initRestore() {
-	Restore.Cmd = &cobra.Command{
-		Use:   "restore",
-		Short: "Run Dgraph (EE) Restore backup",
-		Long: `
-Restore loads objects created with the backup feature in Dgraph Enterprise Edition (EE).
-
-Backups are originated from HTTP at /admin/backup, then can be restored using CLI restore
-command. Restore is intended to be used with new Dgraph clusters in offline state.
-
-The --location flag indicates a source URI with Dgraph backup objects. This URI supports all
-the schemes used for backup.
-
-Source URI formats:
-  [scheme]://[host]/[path]?[args]
-  [scheme]:///[path]?[args]
-  /[path]?[args] (only for local or NFS)
-
-Source URI parts:
-  scheme - service handler, one of: "s3", "minio", "file"
-    host - remote address. ex: "dgraph.s3.amazonaws.com"
-    path - directory, bucket or container at target. ex: "/dgraph/backups/"
-    args - specific arguments that are ok to appear in logs.
-
-The --posting flag sets the posting list parent dir to store the loaded backup files.
-
-Using the --zero flag will use a Dgraph Zero address to update the start timestamp using
-the restored version. Otherwise, the timestamp must be manually updated through Zero's HTTP
-'assign' command.
-
-Dgraph backup creates a unique backup object for each node group, and restore will create
-a posting directory 'p' matching the backup group ID. Such that a backup file
-named '.../r32-g2.backup' will be loaded to posting dir 'p2'.
-
-Usage examples:
-
-# Restore from local dir or NFS mount:
-$ dgraph restore -p . -l /var/backups/dgraph
-
-# Restore from S3:
-$ dgraph restore -p /var/db/dgraph -l s3://s3.us-west-2.amazonaws.com/srfrog/dgraph
-
-# Restore from dir and update Ts:
-$ dgraph restore -p . -l /var/backups/dgraph -z localhost:5080
-
-		`,
-		Args: cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
-			defer x.StartProfile(Restore.Conf).Stop()
-			if err := runRestoreCmd(); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-		},
-	}
-
-	flag := Restore.Cmd.Flags()
-	flag.StringVarP(&opt.location, "location", "l", "",
-		"Sets the source location URI (required).")
-	flag.StringVarP(&opt.pdir, "postings", "p", "",
-		"Directory where posting lists are stored (required).")
-	flag.StringVarP(&opt.zero, "zero", "z", "", "gRPC address for Dgraph zero. ex: localhost:5080")
-	flag.StringVarP(&opt.backupId, "backup-id", "", "", "The ID of the backup series to "+
-		"restore. If empty, it will restore the latest series.")
-	flag.BoolVarP(&opt.forceZero, "force-zero", "", true, "If false, no connection to "+
-		"a zero in the cluster will be required. Keep in mind this requires you to manually "+
-		"update the timestamp and max uid when you start the cluster. The correct values are "+
-		"printed near the end of this command's output.")
-	x.RegisterClientTLSFlags(flag)
-	enc.RegisterFlags(flag)
-	_ = Restore.Cmd.MarkFlagRequired("postings")
-	_ = Restore.Cmd.MarkFlagRequired("location")
 }
 
 func initBackupLs() {
 	LsBackup.Cmd = &cobra.Command{
 		Use:   "lsbackup",
-		Short: "List info on backups in given location",
-		Long: `
-lsbackup looks at a location where backups are stored and prints information about them.
-
-Backups are originated from HTTP at /admin/backup, then can be restored using CLI restore
-command. Restore is intended to be used with new Dgraph clusters in offline state.
-
-The --location flag indicates a source URI with Dgraph backup objects. This URI supports all
-the schemes used for backup.
-
-Source URI formats:
-  [scheme]://[host]/[path]?[args]
-  [scheme]:///[path]?[args]
-  /[path]?[args] (only for local or NFS)
-
-Source URI parts:
-  scheme - service handler, one of: "s3", "minio", "file"
-    host - remote address. ex: "dgraph.s3.amazonaws.com"
-    path - directory, bucket or container at target. ex: "/dgraph/backups/"
-    args - specific arguments that are ok to appear in logs.
-
-Dgraph backup creates a unique backup object for each node group, and restore will create
-a posting directory 'p' matching the backup group ID. Such that a backup file
-named '.../r32-g2.backup' will be loaded to posting dir 'p2'.
-
-Usage examples:
-
-# Run using location in S3:
-$ dgraph lsbackup -l s3://s3.us-west-2.amazonaws.com/srfrog/dgraph
-		`,
-		Args: cobra.NoArgs,
+		Short: "List info on backups in a given location",
+		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			defer x.StartProfile(Restore.Conf).Stop()
 			if err := runLsbackupCmd(); err != nil {
@@ -169,106 +74,66 @@ $ dgraph lsbackup -l s3://s3.us-west-2.amazonaws.com/srfrog/dgraph
 				os.Exit(1)
 			}
 		},
+		Annotations: map[string]string{"group": "tool"},
 	}
-
+	LsBackup.Cmd.SetHelpTemplate(x.NonRootTemplate)
 	flag := LsBackup.Cmd.Flags()
 	flag.StringVarP(&opt.location, "location", "l", "",
 		"Sets the source location URI (required).")
+	flag.BoolVar(&opt.verbose, "verbose", false,
+		"Outputs additional info in backup list.")
 	_ = LsBackup.Cmd.MarkFlagRequired("location")
 }
 
-func runRestoreCmd() error {
-	var (
-		start time.Time
-		zc    pb.ZeroClient
-		err   error
-	)
-	if opt.key, err = enc.ReadKey(Restore.Conf); err != nil {
-		return err
-	}
-	fmt.Println("Restoring backups from:", opt.location)
-	fmt.Println("Writing postings to:", opt.pdir)
-
-	if opt.zero == "" && opt.forceZero {
-		return errors.Errorf("No Dgraph Zero address passed. Use the --force-zero option if you " +
-			"meant to do this")
-	}
-
-	if opt.zero != "" {
-		fmt.Println("Updating Zero timestamp at:", opt.zero)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		tlsConfig, err := x.LoadClientTLSConfigForInternalPort(Restore.Conf)
-		x.Checkf(err, "Unable to generate helper TLS config")
-		callOpts := []grpc.DialOption{grpc.WithBlock()}
-		if tlsConfig != nil {
-			callOpts = append(callOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
-		} else {
-			callOpts = append(callOpts, grpc.WithInsecure())
-		}
-
-		zero, err := grpc.DialContext(ctx, opt.zero, callOpts...)
-		if err != nil {
-			return errors.Wrapf(err, "Unable to connect to %s", opt.zero)
-		}
-		zc = pb.NewZeroClient(zero)
-	}
-
-	start = time.Now()
-	result := worker.RunRestore(opt.pdir, opt.location, opt.backupId, opt.key)
-	if result.Err != nil {
-		return result.Err
-	}
-	if result.Version == 0 {
-		return errors.Errorf("Failed to obtain a restore version")
-	}
-	fmt.Printf("Restore version: %d\n", result.Version)
-	fmt.Printf("Restore max uid: %d\n", result.MaxLeaseUid)
-
-	if zc != nil {
-		ctx, cancelTs := context.WithTimeout(context.Background(), time.Minute)
-		defer cancelTs()
-
-		_, err := zc.Timestamps(ctx, &pb.Num{Val: result.Version})
-		if err != nil {
-			fmt.Printf("Failed to assign timestamp %d in Zero: %v", result.Version, err)
-			return err
-		}
-
-		ctx, cancelUid := context.WithTimeout(context.Background(), time.Minute)
-		defer cancelUid()
-
-		_, err = zc.AssignUids(ctx, &pb.Num{Val: result.MaxLeaseUid})
-		if err != nil {
-			fmt.Printf("Failed to assign maxLeaseId %d in Zero: %v\n", result.MaxLeaseUid, err)
-			return err
-		}
-	}
-
-	fmt.Printf("Restore: Time elapsed: %s\n", time.Since(start).Round(time.Second))
-	return nil
-}
-
 func runLsbackupCmd() error {
-	fmt.Println("Listing backups from:", opt.location)
 	manifests, err := worker.ListBackupManifests(opt.location, nil)
 	if err != nil {
 		return errors.Wrapf(err, "while listing manifests")
 	}
 
-	fmt.Printf("Name\tSince\tGroups\tEncrypted\n")
-	for path, manifest := range manifests {
-		fmt.Printf("%v\t%v\t%v\t%v\n", path, manifest.Since, manifest.Groups, manifest.Encrypted)
+	type backupEntry struct {
+		Path           string              `json:"path"`
+		Since          uint64              `json:"since"`
+		BackupId       string              `json:"backup_id"`
+		BackupNum      uint64              `json:"backup_num"`
+		Encrypted      bool                `json:"encrypted"`
+		Type           string              `json:"type"`
+		Groups         map[uint32][]string `json:"groups,omitempty"`
+		DropOperations []*pb.DropOperation `json:"drop_operations,omitempty"`
 	}
 
+	type backupOutput []backupEntry
+
+	var output backupOutput
+	for _, manifest := range manifests {
+
+		be := backupEntry{
+			Path:      manifest.Path,
+			Since:     manifest.Since,
+			BackupId:  manifest.BackupId,
+			BackupNum: manifest.BackupNum,
+			Encrypted: manifest.Encrypted,
+			Type:      manifest.Type,
+		}
+		if opt.verbose {
+			be.Groups = manifest.Groups
+			be.DropOperations = manifest.DropOperations
+		}
+		output = append(output, be)
+	}
+	b, err := json.MarshalIndent(output, "", "\t")
+	if err != nil {
+		fmt.Println("error:", err)
+	}
+	os.Stdout.Write(b)
+	fmt.Println()
 	return nil
 }
 
 func initExportBackup() {
 	ExportBackup.Cmd = &cobra.Command{
-		Use:   "export-backup",
-		Short: "Export data inside single full or incremental backup.",
+		Use:   "export_backup",
+		Short: "Export data inside single full or incremental backup",
 		Long:  ``,
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -278,24 +143,154 @@ func initExportBackup() {
 				os.Exit(1)
 			}
 		},
+		Annotations: map[string]string{"group": "tool"},
 	}
 
+	ExportBackup.Cmd.SetHelpTemplate(x.NonRootTemplate)
 	flag := ExportBackup.Cmd.Flags()
 	flag.StringVarP(&opt.location, "location", "l", "",
-		"Sets the location of the backup. Only file URIs are supported for now.")
+		`Sets the location of the backup. Both file URIs and s3 are supported.
+		This command will take care of all the full + incremental backups present in the location.`)
 	flag.StringVarP(&opt.destination, "destination", "d", "",
 		"The folder to which export the backups.")
 	flag.StringVarP(&opt.format, "format", "f", "rdf",
 		"The format of the export output. Accepts a value of either rdf or json")
+	flag.BoolVar(&opt.upgrade, "upgrade", false,
+		`If true, retrieve the CORS from DB and append at the end of GraphQL schema.
+		It also deletes the deprecated types and predicates.
+		Use this option when exporting a backup of 20.11 for loading onto 21.03.`)
 	enc.RegisterFlags(flag)
 }
 
-func runExportBackup() error {
+type bufWriter struct {
+	writers *worker.Writers
+	req     *pb.ExportRequest
+}
+
+func exportSchema(writers *worker.Writers, val []byte, pk x.ParsedKey) error {
+	kv := &bpb.KV{}
 	var err error
-	if opt.key, err = enc.ReadKey(ExportBackup.Conf); err != nil {
+	if pk.IsSchema() {
+		kv, err = worker.SchemaExportKv(pk.Attr, val, true)
+		if err != nil {
+			return err
+		}
+	} else {
+		kv, err = worker.TypeExportKv(pk.Attr, val)
+		if err != nil {
+			return err
+		}
+	}
+	return worker.WriteExport(writers, kv, "rdf")
+}
+
+func (bw *bufWriter) Write(buf *z.Buffer) error {
+	kv := &bpb.KV{}
+	err := buf.SliceIterate(func(s []byte) error {
+		kv.Reset()
+		if err := kv.Unmarshal(s); err != nil {
+			return errors.Wrap(err, "processKvBuf failed to unmarshal kv")
+		}
+		pk, err := x.Parse(kv.Key)
+		if err != nil {
+			return errors.Wrap(err, "processKvBuf failed to parse key")
+		}
+		if pk.Attr == "_predicate_" {
+			return nil
+		}
+		if pk.IsSchema() || pk.IsType() {
+			return exportSchema(bw.writers, kv.Value, pk)
+		}
+		if pk.IsData() {
+			pl := &pb.PostingList{}
+			if err := pl.Unmarshal(kv.Value); err != nil {
+				return errors.Wrap(err, "ProcessKvBuf failed to Unmarshal pl")
+			}
+			l := posting.NewList(kv.Key, pl, kv.Version)
+			kvList, err := worker.ToExportKvList(pk, l, bw.req)
+			if err != nil {
+				return errors.Wrap(err, "processKvBuf failed to Export")
+			}
+			if len(kvList.Kv) == 0 {
+				return nil
+			}
+			exportKv := kvList.Kv[0]
+			return worker.WriteExport(bw.writers, exportKv, bw.req.Format)
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
+	buf.Release()
+	return nil
+}
 
-	exporter := worker.BackupExporter{}
-	return exporter.ExportBackup(opt.location, opt.destination, opt.format, opt.key)
+func runExportBackup() error {
+	_, opt.key = ee.GetKeys(ExportBackup.Conf)
+	if opt.format != "json" && opt.format != "rdf" {
+		return errors.Errorf("invalid format %s", opt.format)
+	}
+	// Create exportDir and temporary folder to store the restored backup.
+	exportDir, err := filepath.Abs(opt.destination)
+	if err != nil {
+		return errors.Wrapf(err, "cannot convert path %s to absolute path", exportDir)
+	}
+	if err := os.MkdirAll(exportDir, 0755); err != nil {
+		return errors.Wrapf(err, "cannot create dir %s", exportDir)
+	}
+
+	uri, err := url.Parse(opt.location)
+	if err != nil {
+		return errors.Wrapf(err, "runExportBackup")
+	}
+	handler, err := x.NewUriHandler(uri, nil)
+	if err != nil {
+		return errors.Wrapf(err, "runExportBackup")
+	}
+	latestManifest, err := worker.GetLatestManifest(handler, uri)
+	if err != nil {
+		return errors.Wrapf(err, "runExportBackup")
+	}
+
+	mapDir, err := ioutil.TempDir(x.WorkerConfig.TmpDir, "restore-export")
+	x.Check(err)
+	defer os.RemoveAll(mapDir)
+	glog.Infof("Created temporary map directory: %s\n", mapDir)
+
+	// TODO: Can probably make this procesing concurrent.
+	for gid, _ := range latestManifest.Groups {
+		glog.Infof("Exporting group: %d", gid)
+		req := &pb.RestoreRequest{
+			GroupId:           gid,
+			Location:          opt.location,
+			EncryptionKeyFile: ExportBackup.Conf.GetString("encryption_key_file"),
+			RestoreTs:         1,
+		}
+		if err := worker.RunMapper(req, mapDir); err != nil {
+			return errors.Wrap(err, "Failed to map the backups")
+		}
+
+		in := &pb.ExportRequest{
+			GroupId:     uint32(gid),
+			ReadTs:      latestManifest.Since,
+			UnixTs:      time.Now().Unix(),
+			Format:      opt.format,
+			Destination: exportDir,
+		}
+		writers, err := worker.NewWriters(in)
+		defer writers.Close()
+		if err != nil {
+			return err
+		}
+
+		w := &bufWriter{req: in, writers: writers}
+		if err := worker.RunReducer(w, mapDir); err != nil {
+			return errors.Wrap(err, "Failed to reduce the map")
+		}
+		if err := writers.Close(); err != nil {
+			return errors.Wrap(err, "Failed to finish write")
+		}
+	}
+	return nil
 }

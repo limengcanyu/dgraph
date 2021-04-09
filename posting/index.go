@@ -32,15 +32,15 @@ import (
 	ostats "go.opencensus.io/stats"
 	otrace "go.opencensus.io/trace"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/options"
-	bpb "github.com/dgraph-io/badger/v2/pb"
-	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/options"
+	bpb "github.com/dgraph-io/badger/v3/pb"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/tok"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/ristretto/z"
 )
 
 var emptyCountParams countParams
@@ -228,18 +228,23 @@ func (txn *Txn) addReverseAndCountMutation(ctx context.Context, t *pb.DirectedEd
 			return errors.Wrapf(err, "cannot find single uid list to update with key %s",
 				hex.Dump(dataKey))
 		}
-		err = dataList.Iterate(txn.StartTs, 0, func(p *pb.Posting) error {
+
+		bm, err := dataList.Bitmap(ListOptions{ReadTs: txn.StartTs})
+		if err != nil {
+			return errors.Wrapf(err, "while retriving Bitmap for key %s", hex.Dump(dataKey))
+		}
+
+		for _, uid := range bm.ToArray() {
 			delEdge := &pb.DirectedEdge{
 				Entity:  t.Entity,
-				ValueId: p.Uid,
+				ValueId: uid,
 				Attr:    t.Attr,
 				Op:      pb.DirectedEdge_DEL,
 			}
-			return txn.addReverseAndCountMutation(ctx, delEdge)
-		})
-		if err != nil {
-			return errors.Wrapf(err, "cannot remove existing reverse index entries for key %s",
-				hex.Dump(dataKey))
+			if err := txn.addReverseAndCountMutation(ctx, delEdge); err != nil {
+				return errors.Wrapf(err, "cannot remove existing reverse index entries for key %s",
+					hex.Dump(dataKey))
+			}
 		}
 	}
 
@@ -277,9 +282,8 @@ func (l *List) handleDeleteAll(ctx context.Context, edge *pb.DirectedEdge, txn *
 		Entity: edge.Entity,
 	}
 	// To calculate length of posting list. Used for deletion of count index.
-	var plen int
-	err := l.Iterate(txn.StartTs, 0, func(p *pb.Posting) error {
-		plen++
+	plen := l.Length(txn.StartTs, 0)
+	err := l.IterateAll(txn.StartTs, 0, func(p *pb.Posting) error {
 		switch {
 		case isReversed:
 			// Delete reverse edge for each posting.
@@ -562,8 +566,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 
 	// We write the index in a temporary badger first and then,
 	// merge entries before writing them to p directory.
-	// TODO(Aman): If users are not happy, we could add a flag to choose this dir.
-	tmpIndexDir, err := ioutil.TempDir("", "dgraph_index_")
+	tmpIndexDir, err := ioutil.TempDir(x.WorkerConfig.TmpDir, "dgraph_index_")
 	if err != nil {
 		return errors.Wrap(err, "error creating temp dir for reindexing")
 	}
@@ -575,7 +578,9 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		WithNumVersionsToKeep(math.MaxInt32).
 		WithLogger(&x.ToGlog{}).
 		WithCompression(options.None).
-		WithLoggingLevel(badger.WARNING)
+		WithEncryptionKey(x.WorkerConfig.EncryptionKey).
+		WithLoggingLevel(badger.WARNING).
+		WithMetricsEnabled(false)
 
 	// Set cache if we have encryption.
 	if len(x.WorkerConfig.EncryptionKey) > 0 {
@@ -591,7 +596,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 
 	glog.V(1).Infof(
 		"Rebuilding index for predicate %s: Starting process. StartTs=%d. Prefix=\n%s\n",
-		r.attr, r.startTs, hex.Dump(r.prefix))
+		x.FormatNsAttr(r.attr), r.startTs, hex.Dump(r.prefix))
 
 	// Counter is used here to ensure that all keys are committed at different timestamp.
 	// We set it to 1 in case there are no keys found and NewStreamAt is called with ts=0.
@@ -599,7 +604,8 @@ func (r *rebuilder) Run(ctx context.Context) error {
 
 	tmpWriter := tmpDB.NewManagedWriteBatch()
 	stream := pstore.NewStreamAt(r.startTs)
-	stream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr)
+	stream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (1/2):",
+		x.FormatNsAttr(r.attr))
 	stream.Prefix = r.prefix
 	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
 		// We should return quickly if the context is no longer valid.
@@ -645,8 +651,8 @@ func (r *rebuilder) Run(ctx context.Context) error {
 
 		return &bpb.KVList{Kv: kvs}, nil
 	}
-	stream.Send = func(kvList *bpb.KVList) error {
-		if err := tmpWriter.Write(kvList); err != nil {
+	stream.Send = func(buf *z.Buffer) error {
+		if err := tmpWriter.Write(buf); err != nil {
 			return errors.Wrap(err, "error setting entries in temp badger")
 		}
 
@@ -661,19 +667,21 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		return err
 	}
 	glog.V(1).Infof("Rebuilding index for predicate %s: building temp index took: %v\n",
-		r.attr, time.Since(start))
+		x.FormatNsAttr(r.attr), time.Since(start))
 
 	// Now we write all the created posting lists to disk.
-	glog.V(1).Infof("Rebuilding index for predicate %s: writing index to badger", r.attr)
+	glog.V(1).Infof("Rebuilding index for predicate %s: writing index to badger",
+		x.FormatNsAttr(r.attr))
 	start = time.Now()
 	defer func() {
 		glog.V(1).Infof("Rebuilding index for predicate %s: writing index took: %v\n",
-			r.attr, time.Since(start))
+			x.FormatNsAttr(r.attr), time.Since(start))
 	}()
 
 	writer := pstore.NewManagedWriteBatch()
 	tmpStream := tmpDB.NewStreamAt(counter)
-	tmpStream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (2/2):", r.attr)
+	tmpStream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (2/2):",
+		x.FormatNsAttr(r.attr))
 	tmpStream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
 		l, err := ReadPostingList(key, itr)
 		if err != nil {
@@ -682,39 +690,42 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		// No need to write a loop after ReadPostingList to skip unread entries
 		// for a given key because we only wrote BitDeltaPosting to temp badger.
 
-		alloc := tmpStream.Allocator(itr.ThreadId)
-		kvs, err := l.Rollup(alloc)
+		kvs, err := l.Rollup(nil)
 		if err != nil {
 			return nil, err
 		}
 
 		return &bpb.KVList{Kv: kvs}, nil
 	}
-	tmpStream.Send = func(kvList *bpb.KVList) error {
-		for _, kv := range kvList.Kv {
+	tmpStream.Send = func(buf *z.Buffer) error {
+		return buf.SliceIterate(func(slice []byte) error {
+			kv := &bpb.KV{}
+			if err := kv.Unmarshal(slice); err != nil {
+				return err
+			}
 			if len(kv.Value) == 0 {
-				continue
+				return nil
 			}
 
 			// We choose to write the PL at r.startTs, so it won't be read by txns,
 			// which occurred before this schema mutation.
 			e := &badger.Entry{
-				Key:      y.Copy(kv.Key),
-				Value:    y.Copy(kv.Value),
+				Key:      kv.Key,
+				Value:    kv.Value,
 				UserMeta: BitCompletePosting,
 			}
 			if err := writer.SetEntryAt(e.WithDiscard(), r.startTs); err != nil {
 				return errors.Wrap(err, "error in writing index to pstore")
 			}
-		}
-
-		return nil
+			return nil
+		})
 	}
 
 	if err := tmpStream.Orchestrate(ctx); err != nil {
 		return err
 	}
-	glog.V(1).Infof("Rebuilding index for predicate %s: Flushing all writes.\n", r.attr)
+	glog.V(1).Infof("Rebuilding index for predicate %s: Flushing all writes.\n",
+		x.FormatNsAttr(r.attr))
 	return writer.Flush()
 }
 
@@ -1131,13 +1142,12 @@ func rebuildReverseEdges(ctx context.Context, rb *IndexRebuild) error {
 	builder := rebuilder{attr: rb.Attr, prefix: pk.DataPrefix(), startTs: rb.StartTs}
 	builder.fn = func(uid uint64, pl *List, txn *Txn) error {
 		edge := pb.DirectedEdge{Attr: rb.Attr, Entity: uid}
-		return pl.Iterate(txn.StartTs, 0, func(pp *pb.Posting) error {
+		return pl.IterateAll(txn.StartTs, 0, func(pp *pb.Posting) error {
 			puid := pp.Uid
 			// Add reverse entries based on p.
 			edge.ValueId = puid
 			edge.Op = pb.DirectedEdge_SET
 			edge.Facets = pp.Facets
-			edge.Label = pp.Label
 
 			for {
 				// we only need to build reverse index here.
@@ -1168,7 +1178,7 @@ func (rb *IndexRebuild) needsListTypeRebuild() (bool, error) {
 	}
 	if rb.OldSchema.List && !rb.CurrentSchema.List {
 		return false, errors.Errorf("Type can't be changed from list to scalar for attr: [%s]"+
-			" without dropping it first.", rb.CurrentSchema.Predicate)
+			" without dropping it first.", x.ParseAttr(rb.CurrentSchema.Predicate))
 	}
 
 	return false, nil
@@ -1185,7 +1195,7 @@ func rebuildListType(ctx context.Context, rb *IndexRebuild) error {
 	builder := rebuilder{attr: rb.Attr, prefix: pk.DataPrefix(), startTs: rb.StartTs}
 	builder.fn = func(uid uint64, pl *List, txn *Txn) error {
 		var mpost *pb.Posting
-		err := pl.Iterate(txn.StartTs, 0, func(p *pb.Posting) error {
+		err := pl.IterateAll(txn.StartTs, 0, func(p *pb.Posting) error {
 			// We only want to modify the untagged value. There could be other values with a
 			// lang tag.
 			if p.Uid == math.MaxUint64 {
@@ -1218,7 +1228,6 @@ func rebuildListType(ctx context.Context, rb *IndexRebuild) error {
 			Value:     mpost.Value,
 			ValueType: mpost.ValType,
 			Op:        pb.DirectedEdge_SET,
-			Label:     mpost.Label,
 			Facets:    mpost.Facets,
 		}
 		return pl.addMutation(ctx, txn, newEdge)
@@ -1245,4 +1254,10 @@ func DeletePredicate(ctx context.Context, attr string) error {
 	}
 
 	return schema.State().Delete(attr)
+}
+
+// DeleteNamespace bans the namespace and deletes its predicates/types from the schema.
+func DeleteNamespace(ns uint64) error {
+	schema.State().DeletePredsForNs(ns)
+	return pstore.BanNamespace(ns)
 }

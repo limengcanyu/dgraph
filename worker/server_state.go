@@ -22,12 +22,35 @@ import (
 	"os"
 	"time"
 
-	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v3"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/raftwal"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/golang/glog"
+)
+
+const (
+	// NOTE: SuperFlag defaults must include every possible option that can be used. This way, if a
+	//       user makes a typo while defining a SuperFlag we can catch it and fail right away rather
+	//       than fail during runtime while trying to retrieve an option that isn't there.
+	//
+	//       For easy readability, keep the options without default values (if any) at the end of
+	//       the *Defaults string. Also, since these strings are printed in --help text, avoid line
+	//       breaks.
+	AclDefaults       = `access-ttl=6h; refresh-ttl=30d; secret-file=;`
+	AuditDefaults     = `compress=false; days=10; size=100; dir=; output=; encrypt-file=;`
+	BadgerDefaults    = `compression=snappy; goroutines=8; max-retries=-1;`
+	RaftDefaults      = `learner=false; snapshot-after=10000; pending-proposals=256; idx=; group=;`
+	SecurityDefaults  = `token=; whitelist=;`
+	LudicrousDefaults = `enabled=false; concurrency=2000;`
+	CDCDefaults       = `file=; kafka=; sasl_user=; sasl_password=; ca_cert=; client_cert=; ` +
+		`client_key=;`
+	LimitDefaults = `mutations=allow; query-edge=1000000; normalize-node=10000; ` +
+		`mutations-nquad=1000000; disallow-drop=false; max-pending-queries=10000; query-timeout
+		=0ms;`
+	GraphQLDefaults = `introspection=true; debug=false; extensions=true; poll-interval=1s; ` +
+		`lambda-url=;`
 )
 
 // ServerState holds the state of the Dgraph server.
@@ -98,8 +121,8 @@ func (s *ServerState) initStorage() {
 	{
 		// Write Ahead Log directory
 		x.Checkf(os.MkdirAll(Config.WALDir, 0700), "Error while creating WAL dir.")
-		s.WALstore = raftwal.Init(Config.WALDir)
-		// TODO: Add encryption back to WALStore.
+		s.WALstore, err = raftwal.InitEncrypted(Config.WALDir, x.WorkerConfig.EncryptionKey)
+		x.Check(err)
 	}
 	{
 		// Postings directory
@@ -107,10 +130,11 @@ func (s *ServerState) initStorage() {
 		// for posting lists, so the cost of sync writes is amortized.
 		x.Check(os.MkdirAll(Config.PostingDir, 0700))
 		opt := badger.DefaultOptions(Config.PostingDir).
-			WithValueThreshold(1 << 10 /* 1KB */).
 			WithNumVersionsToKeep(math.MaxInt32).
+			WithNumGoroutines(int(x.WorkerConfig.Badger.GetUint64("goroutines"))).
 			WithBlockCacheSize(Config.PBlockCacheSize).
-			WithIndexCacheSize(Config.PIndexCacheSize)
+			WithIndexCacheSize(Config.PIndexCacheSize).
+			WithNamespaceOffset(x.NamespaceOffset)
 		opt = setBadgerOptions(opt)
 
 		// Print the options w/o exposing key.
@@ -126,11 +150,14 @@ func (s *ServerState) initStorage() {
 		// zero out from memory
 		opt.EncryptionKey = nil
 	}
+	// Temp directory
+	x.Check(os.MkdirAll(x.WorkerConfig.TmpDir, 0700))
 
-	s.gcCloser = z.NewCloser(2)
+	s.gcCloser = z.NewCloser(3)
 	go x.RunVlogGC(s.Pstore, s.gcCloser)
 	// Commenting this out because Badger is doing its own cache checks.
 	go x.MonitorCacheHealth(s.Pstore, s.gcCloser)
+	go x.MonitorDiskMetrics("postings_fs", Config.PostingDir, s.gcCloser)
 }
 
 // Dispose stops and closes all the resources inside the server state.
